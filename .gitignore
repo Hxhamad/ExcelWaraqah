@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+full_refresh.log
+*.xlsx
+.~lock.*
