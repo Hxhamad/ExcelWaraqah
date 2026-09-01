@@ -325,6 +325,15 @@ def snapshot_symbol_count(data_dir):
 
 
 def main():
+    # Arabic console output must survive a non-UTF-8 (cp1252) console.
+    import sys
+    for _stream in (sys.stdout, sys.stderr):
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
     parser = argparse.ArgumentParser(description="Verify a built v2 workbook.")
     parser.add_argument("workbook", help="path to the xlsx to verify")
     parser.add_argument("--data-dir", default=os.path.join(HERE, "data"),

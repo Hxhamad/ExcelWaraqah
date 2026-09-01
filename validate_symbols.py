@@ -2,12 +2,22 @@
 # keep those with price history, fill EN name + EN sector. Output: v2/symbols.csv
 import csv, json, os, sys, time
 
-sys.path.insert(0, 'C:/Users/Hamad/portfolio_excel/v2')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Arabic console output must survive a non-UTF-8 (cp1252) console.
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 import yfinance as yf
 
-SRC = 'C:/Users/Hamad/portfolio_excel/v2/symbols_full.csv'
-OUT = 'C:/Users/Hamad/portfolio_excel/v2/symbols.csv'
-STATE = 'C:/Users/Hamad/portfolio_excel/v2/data/validate_state.json'
+_BASE = os.path.dirname(os.path.abspath(__file__))
+SRC = os.path.join(_BASE, 'symbols_full.csv')
+OUT = os.path.join(_BASE, 'symbols.csv')
+STATE = os.path.join(_BASE, 'data', 'validate_state.json')
 
 SECTOR_MAP = {
     'الطاقة': 'Energy', 'المواد الأساسية': 'Materials', 'التأمين': 'Insurance',

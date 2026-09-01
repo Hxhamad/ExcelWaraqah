@@ -1189,6 +1189,15 @@ def build(out_path, data_dir="data", preserve_from=None):
 
 
 def main():
+    # Arabic console output must survive a non-UTF-8 (cp1252) console.
+    import sys
+    for _stream in (sys.stdout, sys.stderr):
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
     default_out = os.path.join(HERE, "..", "Sahm_Portfolio_Analysis_v2.xlsx")
     parser = argparse.ArgumentParser(
         description="Build the Saudi stock analysis workbook.")
