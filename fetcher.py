@@ -15,7 +15,7 @@ import json
 import os
 import sys
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -28,6 +28,7 @@ from metrics import (  # noqa: E402
     momentum_12_1,
     rsi14,
     sma200_flag,
+    volatility_state,
     vol_regime,
 )
 
@@ -35,11 +36,38 @@ FIRST_YEAR = 2015
 
 ANNUAL_FIELDS = [
     "symbol", "year", "close", "ret", "vol", "maxdd",
-    "divs", "div_yield", "momentum", "eps",
+    "divs", "div_yield", "momentum", "eps", "price_date",
+    "return_basis", "dividend_unit", "source",
 ]
 STATEMENT_FIELDS = [
-    "symbol", "year", "revenue", "net_income", "eps", "roe", "de", "payout",
+    "symbol", "year", "period_end", "revenue", "net_income", "eps", "roe", "de", "payout",
 ]
+
+MARKET_DEFAULTS = {
+    "Tadawul": {
+        "currency": "SAR", "calendar": "Saudi Exchange", "settlement": "T+2",
+        "timezone": "Asia/Riyadh", "session": "Sunday–Thursday; core 10:00–15:00",
+        "dst": "No daylight-saving shift", "quantity_rule": "Whole shares; minimum 1",
+        "order_rule": "Broker/account capabilities must be confirmed before approval",
+        "rule_source": "https://www.saudiexchange.sa/wps/portal/saudiexchange/trading/market-services/equities?locale=en",
+    },
+    "NYSE": {
+        "currency": "USD", "calendar": "NYSE", "settlement": "T+1",
+        "timezone": "America/New_York", "session": "Core session 09:30–16:00 ET",
+        "dst": "America/New_York daylight-saving rules",
+        "quantity_rule": "Whole/fractional shares depend on broker and security",
+        "order_rule": "Broker/account capabilities must be confirmed before approval",
+        "rule_source": "https://www.sec.gov/rules-regulations/2023/02/34-96930",
+    },
+    "NASDAQ": {
+        "currency": "USD", "calendar": "NASDAQ", "settlement": "T+1",
+        "timezone": "America/New_York", "session": "Core session 09:30–16:00 ET",
+        "dst": "America/New_York daylight-saving rules",
+        "quantity_rule": "Whole/fractional shares depend on broker and security",
+        "order_rule": "Broker/account capabilities must be confirmed before approval",
+        "rule_source": "https://www.sec.gov/rules-regulations/2023/02/34-96930",
+    },
+}
 
 # Yahoo renames statement lines between sectors; try each label in order.
 REVENUE_KEYS = ("Total Revenue", "Operating Revenue")
@@ -168,16 +196,57 @@ def _daily_returns(values):
 # single ticker
 # --------------------------------------------------------------------------
 
-def fetch_one(code):
-    """Fetch every workbook input for one 4-digit Tadawul code.
+def normalize_security(raw):
+    """Normalize legacy Saudi codes or a unified security mapping."""
+    if isinstance(raw, dict):
+        item = dict(raw)
+        ticker = str(item.get("ticker") or item.get("code") or "").strip().upper()
+        exchange_raw = str(item.get("exchange") or "").strip()
+        exchange = {
+            "TADAWUL": "Tadawul", "SAUDI EXCHANGE": "Tadawul",
+            "NYSE": "NYSE", "NASDAQ": "NASDAQ",
+        }.get(exchange_raw.upper(), exchange_raw) or (
+            "Tadawul" if ticker.isdigit() and len(ticker) == 4 else "NASDAQ")
+        currency = str(item.get("currency") or
+                       MARKET_DEFAULTS.get(exchange, {}).get("currency") or "USD").upper()
+        yahoo_symbol = str(item.get("yahoo_symbol") or
+                           ((ticker + ".SR") if exchange == "Tadawul" else ticker)).strip()
+        security_id = str(item.get("security_id") or
+                          (("SA-" + ticker) if exchange == "Tadawul" else ("US-" + ticker))).strip()
+    else:
+        ticker = str(raw).strip().upper()
+        exchange = "Tadawul" if ticker.isdigit() and len(ticker) == 4 else "NASDAQ"
+        currency = "SAR" if exchange == "Tadawul" else "USD"
+        yahoo_symbol = ticker + ".SR" if exchange == "Tadawul" else ticker
+        security_id = "SA-" + ticker if exchange == "Tadawul" else "US-" + ticker
+    defaults = MARKET_DEFAULTS.get(exchange, {})
+    return {
+        "security_id": security_id,
+        "ticker": ticker,
+        "code": ticker,
+        "exchange": exchange,
+        "currency": currency,
+        "yahoo_symbol": yahoo_symbol,
+        "calendar": defaults.get("calendar", "Pending confirmation"),
+        "settlement": defaults.get("settlement", "Pending confirmation"),
+        "timezone": defaults.get("timezone", "Pending confirmation"),
+        "session": defaults.get("session", "Pending confirmation"),
+        "dst": defaults.get("dst", "Pending confirmation"),
+        "quantity_rule": defaults.get("quantity_rule", "Pending broker confirmation"),
+        "order_rule": defaults.get("order_rule", "Pending broker confirmation"),
+        "rule_source": defaults.get("rule_source"),
+        "instrument_type": str(item.get("instrument_type") or "Equity")
+        if isinstance(raw, dict) else "Equity",
+    }
 
-    Returns None only when the ticker has no usable price history; otherwise a
-    dict whose unavailable fields are None.
-    """
+
+def fetch_security(raw):
+    """Fetch one unified Saudi or US security using an explicit identifier map."""
     import yfinance as yf
 
-    code = str(code).strip()
-    ticker_id = "%s.SR" % code
+    security = normalize_security(raw)
+    code = security["ticker"]
+    ticker_id = security["yahoo_symbol"]
 
     try:
         ticker = yf.Ticker(ticker_id)
@@ -186,7 +255,9 @@ def fetch_one(code):
 
     # --- prices (the one hard requirement) --------------------------------
     try:
-        hist = ticker.history(period="max")
+        # Explicitly use the total-return series.  yfinance's default has
+        # changed historically, so never depend on an implicit setting.
+        hist = ticker.history(period="max", auto_adjust=True, actions=True)
     except Exception:
         hist = None
     if hist is None or getattr(hist, "empty", True) or "Close" not in hist.columns:
@@ -226,18 +297,56 @@ def fetch_one(code):
     two_years = _safe(lambda: closes.loc[last_date - timedelta(days=730):])
     dd_values = [float(x) for x in two_years.tolist()] if two_years is not None else []
 
+    vol = _safe(volatility_state, close_list) or {}
+    fetched_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    try:
+        price_as_of = last_date.date().isoformat()
+    except Exception:
+        price_as_of = str(last_date)
+    try:
+        price_observed_at = last_date.isoformat()
+    except Exception:
+        price_observed_at = str(last_date)
     snapshot = {
         "code": code,
+        "security_id": security["security_id"],
+        "ticker": security["ticker"],
+        "exchange": security["exchange"],
+        "currency": info.get("currency") or security["currency"],
+        "yahoo_symbol": ticker_id,
+        "calendar": security["calendar"],
+        "settlement": security["settlement"],
+        "market_timezone": security["timezone"],
+        "market_session": security["session"],
+        "dst_handling": security["dst"],
+        "quantity_rule": security["quantity_rule"],
+        "order_rule": security["order_rule"],
+        "market_rule_source": security["rule_source"],
+        "instrument_type": info.get("quoteType") or security["instrument_type"],
         "name_en": info.get("longName") or info.get("shortName") or None,
         "sector": info.get("sector") or None,
         "price": _round(closes.iloc[-1], 4),
+        "price_as_of": price_as_of,
+        "price_observed_at": price_observed_at,
+        "fetched_at": fetched_at,
+        "source": "Yahoo Finance",
+        "source_url": "https://finance.yahoo.com/quote/%s" % ticker_id,
+        "price_basis": "auto-adjusted Close (splits and cash dividends)",
+        "return_basis": "total return from auto-adjusted Close",
+        "dividend_unit": "%s per share" % (info.get("currency") or security["currency"]),
+        "fundamentals_basis": "Annual statements; trailing provider ratios where labelled",
+        "publication_date": None,
         "ret_1w": _trailing_return(closes, 7),
         "ret_1m": _trailing_return(closes, 30),
         "ret_3m": _trailing_return(closes, 91),
         "ret_6m": _trailing_return(closes, 182),
         "ret_1y": _trailing_return(closes, 365),
         "rsi14": _round(_safe(rsi14, close_list), 2),
-        "vol_regime": _safe(vol_regime, close_list),
+        "vol_regime": vol.get("level") or _safe(vol_regime, close_list),
+        "vol_level": vol.get("level"),
+        "vol_trend": vol.get("trend"),
+        "vol_short": _round(vol.get("short_vol")),
+        "vol_long": _round(vol.get("long_vol")),
         "sma200_flag": _safe(sma200_flag, close_list),
         "maxdd_2y": _round(_safe(max_drawdown, dd_values)),
     }
@@ -255,6 +364,13 @@ def fetch_one(code):
         code, closes, divs, snapshot["statement_rows"]
     )
     return snapshot
+
+
+def fetch_one(code):
+    """Backward-compatible Tadawul entry point for a four-digit code."""
+    return fetch_security({
+        "ticker": str(code).strip(), "exchange": "Tadawul", "currency": "SAR"
+    })
 
 
 def _statement_rows(code, income, balance, cashflow):
@@ -300,6 +416,8 @@ def _statement_rows(code, income, balance, cashflow):
         rows.append({
             "symbol": code,
             "year": int(year),
+            "period_end": getattr(col, "date", lambda: col)().isoformat()
+            if hasattr(col, "date") else str(col),
             "revenue": _round(revenue, 2),
             "net_income": _round(net_income, 2),
             "eps": _round(eps, 4),
@@ -358,6 +476,10 @@ def _annual_rows(code, closes, divs, statement_rows):
             "div_yield": _round(div_yield, 4),
             "momentum": _round(momentum),
             "eps": eps_by_year.get(year),
+            "price_date": _year_slice(closes, year).index[-1].date().isoformat(),
+            "return_basis": "total return from auto-adjusted Close",
+            "dividend_unit": "cash per share in listing currency",
+            "source": "Yahoo Finance",
         })
     return rows
 
@@ -423,12 +545,12 @@ def _snapshot_only(record):
             if k not in ("annual_rows", "statement_rows")}
 
 
-def fetch_all(codes, sleep_s=1.0, data_dir="data"):
+def fetch_all(codes, sleep_s=1.0, data_dir="data", force=False):
     """Fetch each code, merging results into the data_dir artefacts.
 
-    Codes already present in annual_metrics.csv are skipped so an interrupted
-    run can simply be re-run. Returns {code: snapshot} for every code handled,
-    cached ones included.
+    Codes already present in annual_metrics.csv are skipped unless ``force`` is
+    true, so an interrupted run can resume while a deliberate evidence refresh
+    can replace stale records. Returns {code: snapshot} for every code handled.
     """
     os.makedirs(data_dir, exist_ok=True)
     annual_path, statements_path, snapshot_path = _paths(data_dir)
@@ -441,8 +563,9 @@ def fetch_all(codes, sleep_s=1.0, data_dir="data"):
     results = {}
 
     for index, raw in enumerate(codes):
-        code = str(raw).strip()
-        if code in cached:
+        security = normalize_security(raw)
+        code = security["ticker"]
+        if code in cached and not force:
             print("fetched %s skipped (cached)" % code)
             if code in snapshots:
                 results[code] = snapshots[code]
@@ -452,7 +575,7 @@ def fetch_all(codes, sleep_s=1.0, data_dir="data"):
             time.sleep(sleep_s)
 
         try:
-            record = fetch_one(code)
+            record = fetch_security(security)
         except Exception as exc:  # fetch_one guards internally; belt and braces
             print("FAIL %s error (%s)" % (code, exc))
             continue

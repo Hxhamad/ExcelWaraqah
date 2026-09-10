@@ -1,8 +1,9 @@
-"""Workbook builder for the Saudi (Tadawul) stock analysis tool, v2.
+"""Workbook builder for the Saudi/US personal investment book, v3.
 
-Builds a 7-sheet xlsx from the CSV/JSON artefacts produced by fetcher.py:
+Builds a 12-sheet xlsx from the CSV/JSON artefacts produced by fetcher.py:
 
-    Portfolio | Stock Lookup | Risk & Horizons | DB | Statements | Symbols | Guide
+    Portfolio | Orders | Stock Lookup | Performance | Activity | Sharia |
+    Risk & Horizons | DB | Statements | Symbols | Checks | Guide
 
 Design notes that matter for anyone editing this file
 -----------------------------------------------------
@@ -11,9 +12,9 @@ Design notes that matter for anyone editing this file
   range gets its anchor cell written BEFORE the merge call.
 * Every row number is a module-level constant; formulas are assembled with
   f-strings so a layout change never leaves a stale hardcoded row behind.
-* Formulas stay in the Excel-2007 function set (VLOOKUP / INDEX / MATCH / IF /
-  OR / AND / COUNTIF / SUM / MAX / IFERROR / ISNA / LEN / ROUND / TEXT) so that
-  LibreOffice's headless recalc evaluates all of them.
+* Formulas favor broadly supported Excel/Google Sheets functions.  A small
+  number of modern functions such as IFS are used where they materially reduce
+  nested-formula risk; LibreOffice and live Google Sheets are both verified.
 * Static analytics (scores, ratings, horizon verdicts, P/E, missing-data notes)
   are computed in Python and written as values; formulas are only used where the
   user's own inputs must flow through.
@@ -42,8 +43,10 @@ import csv
 import json
 import os
 import sys
+from datetime import date, datetime
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -53,12 +56,15 @@ sys.path.insert(0, HERE)
 import metrics  # noqa: E402
 from symbols import load_symbols  # noqa: E402
 
+BOOK_BUILD_DATE = date.today().isoformat()
+BOOK_BUILD_ID_DATE = BOOK_BUILD_DATE.replace("-", "")
+
 # --------------------------------------------------------------------------
 # layout constants
 # --------------------------------------------------------------------------
 SHEET_ORDER = [
-    "Portfolio", "Stock Lookup", "Risk & Horizons",
-    "DB", "Statements", "Symbols", "Guide",
+    "Portfolio", "Orders", "Stock Lookup", "Performance", "Activity",
+    "Sharia", "Risk & Horizons", "DB", "Statements", "Symbols", "Checks", "Guide",
 ]
 
 # Portfolio
@@ -354,8 +360,8 @@ def _verdict(points, present):
     return "محايد"
 
 
-def near_verdict(sma_flag, rsi, vol_reg, ret_1m):
-    """1-3 months: trend filter + RSI extremes + volatility regime + 1M drift."""
+def near_verdict(sma_flag, rsi, vol_level, vol_trend, ret_3m, ret_6m):
+    """Six-month view: medium trend, momentum, RSI, and volatility direction."""
     pts = 0
     present = 0
     if sma_flag:
@@ -369,26 +375,32 @@ def near_verdict(sma_flag, rsi, vol_reg, ret_1m):
             pts += 1
         elif rsi >= 40:
             pts += 1
-    if vol_reg:
+    if vol_level:
         present += 1
-        if vol_reg == "HIGH":
+        if vol_level == "HIGH":
             pts -= 1
-    if ret_1m is not None:
+    if vol_trend:
         present += 1
-        pts += 1 if ret_1m > 0 else -1
-    return _verdict(pts, present)
-
-
-def mid_verdict(ret_6m, ret_1y, sma_flag, pe, maxdd_2y):
-    """6-18 months: medium momentum + trend + valuation + drawdown tolerance."""
-    pts = 0
-    present = 0
+        pts += 1 if vol_trend == "FALLING" else (-1 if vol_trend == "RISING" else 0)
+    if ret_3m is not None:
+        present += 1
+        pts += 1 if ret_3m > 0 else -1
     if ret_6m is not None:
         present += 1
         pts += 1 if ret_6m > 0 else -1
+    return _verdict(pts, present)
+
+
+def mid_verdict(ret_1y, momentum, sma_flag, pe, maxdd_2y):
+    """Two-year view: return, 12-1 momentum, trend, value and drawdown."""
+    pts = 0
+    present = 0
     if ret_1y is not None:
         present += 1
         pts += 1 if ret_1y > 0 else -1
+    if momentum is not None:
+        present += 1
+        pts += 1 if momentum > 0 else -1
     if sma_flag:
         present += 1
         pts += 1 if sma_flag == "above" else -1
@@ -405,7 +417,7 @@ def mid_verdict(ret_6m, ret_1y, sma_flag, pe, maxdd_2y):
 
 
 def far_verdict(roe, div_yield, payout, pe):
-    """3+ years: return on equity, income, payout sustainability, valuation."""
+    """Five-year view: quality, income sustainability and valuation."""
     pts = 0
     present = 0
     if roe is not None:
@@ -464,16 +476,31 @@ def build_rows(data):
         if maxdd_2y is None:
             maxdd_2y = last.get("maxdd")
         sma_flag = snap.get("sma200_flag")
-        vol_reg = snap.get("vol_regime")
+        vol_level = snap.get("vol_level") or snap.get("vol_regime")
+        vol_trend = snap.get("vol_trend")
         rsi = snap.get("rsi14")
         momentum = last.get("momentum")
 
-        score = metrics.composite_score(pe, roe, div_yield, (sma_flag, momentum), maxdd_2y)
+        score_meta = metrics.composite_score_with_coverage(
+            pe, roe, div_yield, (sma_flag, momentum), maxdd_2y
+        )
+        score = score_meta["score"]
         # Flag only the inputs that actually feed the score and the verdicts -
         # this is what "الحكم محايد للأجزاء الناقصة" refers to. Gaps in the old
         # annual history are reported separately (Statements col "ملاحظة").
         missing_inputs = any(v is None for v in
                              (pe, roe, div_yield, sma_flag, momentum, maxdd_2y))
+        data_as_of = snap.get("price_as_of")
+        freshness = "Unknown — refresh required"
+        if data_as_of:
+            try:
+                age_days = (date.today() - datetime.fromisoformat(
+                    str(data_as_of).replace("Z", "+00:00")
+                ).date()).days
+                freshness = "Fresh" if age_days <= 5 else "Stale"
+            except (TypeError, ValueError):
+                freshness = "Unknown — invalid date"
+        actionable = bool(score_meta["actionable"] and freshness == "Fresh")
         rows.append({
             "code": code,
             "name": entry["name"],
@@ -486,16 +513,77 @@ def build_rows(data):
             "ret_3m": snap.get("ret_3m"),
             "ret_6m": snap.get("ret_6m"),
             "ret_1y": snap.get("ret_1y"),
+            "momentum": momentum,
             "rsi": rsi,
-            "vol_regime": "مرتفع" if vol_reg == "HIGH" else ("عادي" if vol_reg else NA),
+            "vol_regime": ({"HIGH": "مرتفع", "NORMAL": "عادي", "LOW": "منخفض"}
+                           .get(vol_level, NA)),
+            "vol_trend": ({"RISING": "صاعد", "STABLE": "مستقر", "FALLING": "هابط"}
+                          .get(vol_trend, NA)),
             "sma200": "فوق" if sma_flag == "above" else ("تحت" if sma_flag == "below" else NA),
             "maxdd_2y": maxdd_2y,
             "oil_beta": oil_beta(entry["sector"]),
-            "near": near_verdict(sma_flag, rsi, vol_reg, snap.get("ret_1m")),
-            "mid": mid_verdict(snap.get("ret_6m"), snap.get("ret_1y"), sma_flag, pe, maxdd_2y),
+            "near": near_verdict(sma_flag, rsi, vol_level, vol_trend,
+                                 snap.get("ret_3m"), snap.get("ret_6m")),
+            "mid": mid_verdict(snap.get("ret_1y"), momentum, sma_flag, pe, maxdd_2y),
             "far": far_verdict(roe, div_yield, payout, pe),
             "score": score,
-            "rating": metrics.rating(score),
+            "rating": metrics.rating(score, score_meta["completeness"]),
+            "completeness": score_meta["completeness"],
+            "actionable": actionable,
+            "data_as_of": data_as_of,
+            "freshness": freshness,
+            "fetched_at": snap.get("fetched_at"),
+            "source": snap.get("source") or "Yahoo Finance (legacy snapshot)",
+            "source_url": snap.get("source_url"),
+            "security_id": snap.get("security_id") or ("SA-" + code),
+            "exchange": snap.get("exchange") or "Tadawul",
+            "currency": snap.get("currency") or "SAR",
+            "fx_to_sar": 1.0 if (snap.get("currency") or "SAR") == "SAR" else None,
+            "market_calendar": snap.get("calendar") or (
+                "Saudi Exchange" if (snap.get("exchange") or "Tadawul") == "Tadawul"
+                else "US market"
+            ),
+            "settlement": snap.get("settlement") or (
+                "T+2" if (snap.get("exchange") or "Tadawul") == "Tadawul" else "T+1"
+            ),
+            "fundamentals_period": str(max(stmt_years)) if stmt_years else None,
+            "instrument_type": snap.get("instrument_type") or "Equity",
+            "market_timezone": snap.get("market_timezone") or (
+                "Asia/Riyadh" if (snap.get("exchange") or "Tadawul") == "Tadawul"
+                else "America/New_York"
+            ),
+            "market_session": snap.get("market_session") or (
+                "Sunday–Thursday; core 10:00–15:00" if
+                (snap.get("exchange") or "Tadawul") == "Tadawul"
+                else "Core session 09:30–16:00 ET"
+            ),
+            "dst_handling": snap.get("dst_handling") or (
+                "No daylight-saving shift" if
+                (snap.get("exchange") or "Tadawul") == "Tadawul"
+                else "America/New_York daylight-saving rules"
+            ),
+            "quantity_rule": snap.get("quantity_rule") or (
+                "Whole shares; minimum 1" if
+                (snap.get("exchange") or "Tadawul") == "Tadawul"
+                else "Whole/fractional shares depend on broker and security"
+            ),
+            "order_rule": snap.get("order_rule") or
+                "Broker/account capabilities must be confirmed before approval",
+            "fundamentals_basis": snap.get("fundamentals_basis") or
+                "Annual history; trailing ratios only where labelled",
+            "publication_date": snap.get("publication_date"),
+            "observation_time": snap.get("price_observed_at") or data_as_of,
+            "retrieval_time": snap.get("fetched_at"),
+            "price_basis": snap.get("price_basis") or "Adjusted close for return series",
+            "return_basis": snap.get("return_basis") or
+                "Total return from adjusted close where available",
+            "dividend_unit": snap.get("dividend_unit") or
+                "%s per share" % (snap.get("currency") or "SAR"),
+            "market_rule_source": snap.get("market_rule_source") or (
+                "https://www.saudiexchange.sa/wps/portal/saudiexchange/trading/market-services/equities?locale=en"
+                if (snap.get("exchange") or "Tadawul") == "Tadawul" else
+                "https://www.sec.gov/rules-regulations/2023/02/34-96930"
+            ),
             "pe": pe,
             "roe": roe,
             "payout": payout,
@@ -597,20 +685,219 @@ def read_preserved(path):
     return out
 
 
+def restore_manual_records(wb, path):
+    """Restore durable user inputs/history without copying calculated cells.
+
+    This makes refreshes non-destructive for the transaction ledger, Sharia
+    evidence, proposal decisions, performance history, owner settings and
+    review log.  Formula/helper columns are regenerated from the current code.
+    """
+    if not path or not os.path.exists(path):
+        return
+    try:
+        old = load_workbook(path, data_only=False)
+    except Exception as exc:  # noqa: BLE001
+        print("WARNING: could not restore manual book records (%s)" % exc)
+        return
+
+    # Activity is intentionally positional: its schema is stable and formula
+    # columns are excluded.  The other durable records are restored by header
+    # name below so schema upgrades do not silently move owner inputs.
+    specs = {
+        "Activity": (6, 505, list(range(1, 18)) + [25, 26, 28]),
+    }
+    for name, (first, last, columns) in specs.items():
+        if name not in old.sheetnames or name not in wb.sheetnames:
+            continue
+        src, dst = old[name], wb[name]
+        for row in range(first, min(last, src.max_row) + 1):
+            for col in columns:
+                value = src.cell(row=row, column=col).value
+                if value is not None:
+                    dst.cell(row=row, column=col).value = value
+    def headers(ws, row=5):
+        return {str(ws.cell(row=row, column=col).value).strip(): col
+                for col in range(1, ws.max_column + 1)
+                if ws.cell(row=row, column=col).value is not None}
+
+    def keyed_rows(ws, key_col, first=6, last=505):
+        result = {}
+        for row in range(first, min(last, ws.max_row) + 1):
+            key = ws.cell(row=row, column=key_col).value
+            if key is not None and str(key).strip():
+                result[str(key).strip()] = row
+        return result
+
+    def first_blank_key_row(ws, key_col, first=6, last=505):
+        for row in range(first, last + 1):
+            value = ws.cell(row=row, column=key_col).value
+            if value is None or not str(value).strip():
+                return row
+        return None
+
+    # Sharia: preserve evidence and owner review fields, but regenerate the
+    # eligibility/holding-review formulas.  Legacy v2 labels are mapped to the
+    # richer v3 evidence schema without pretending provider == methodology.
+    if "Sharia" in old.sheetnames and "Sharia" in wb.sheetnames:
+        src, dst = old["Sharia"], wb["Sharia"]
+        sh, dh = headers(src), headers(dst)
+        aliases = {
+            "Methodology / Provider": "Authority / Provider",
+            "Business Activity": "Business Activity Evidence",
+            "Financial Ratios": "Financial Ratio Evidence",
+            "Purification Notes": "Purification Method",
+        }
+        allowed = {
+            "Security ID", "Ticker", "Company", "Exchange", "Status",
+            "Authority / Provider", "Methodology", "Methodology Version",
+            "Evidence URL", "Reporting Period", "Screen Date", "Next Review",
+            "Business Activity Evidence", "Financial Ratio Evidence",
+            "Purification Method", "Purification Due SAR", "Purification Paid SAR",
+            "Payment Date", "Change Since Prior Review", "Reviewer", "Notes",
+        }
+        src_key = sh.get("Security ID")
+        dst_key = dh.get("Security ID")
+        if src_key and dst_key:
+            destinations = keyed_rows(dst, dst_key)
+            for src_row in range(6, min(505, src.max_row) + 1):
+                key = src.cell(src_row, src_key).value
+                if key is None or not str(key).strip():
+                    continue
+                key = str(key).strip()
+                dst_row = destinations.get(key) or first_blank_key_row(dst, dst_key)
+                if dst_row is None:
+                    break
+                destinations[key] = dst_row
+                for old_name, src_col in sh.items():
+                    new_name = aliases.get(old_name, old_name)
+                    if new_name not in allowed or new_name not in dh:
+                        continue
+                    value = src.cell(src_row, src_col).value
+                    if value is not None and not (isinstance(value, str) and value.startswith("=")):
+                        dst.cell(dst_row, dh[new_name]).value = value
+
+    # Orders: preserve proposal identity, owner decisions and broker evidence;
+    # regenerate research summaries, risk math and control formulas every run.
+    if "Orders" in old.sheetnames and "Orders" in wb.sheetnames:
+        src, dst = old["Orders"], wb["Orders"]
+        sh, dh = headers(src), headers(dst)
+        aliases = {
+            "Quantity": "Proposed Quantity", "Stop Price": "Stop / Review Price",
+            "Expiry": "Valid Until", "Risk / Invalidation": "Thesis Invalidation",
+            "Post-Trade Position %": "Proposed Position %",
+            "Post-Trade Sector %": "Proposed Sector %",
+        }
+        allowed = {
+            "Proposal ID", "Version", "Rank", "Created At", "Reviewed At", "Horizon",
+            "Security ID", "Ticker", "Company", "Exchange", "Broker", "Account",
+            "Currency", "Action", "Order Type", "Entry Condition", "Proposed Quantity",
+            "Limit Price", "Stop / Review Price", "Valid Until", "Evidence URLs",
+            "Why I Own It", "Thesis Invalidation", "Confidence", "Status",
+            "User Decision", "Decision Date", "Broker Order ID", "Filled Quantity",
+            "Average Fill Price", "Execution Transaction ID", "Review ID",
+            "Last Checked", "Notes",
+        }
+        action_map = {"Sell": "Exit"}
+        status_map = {
+            "Draft": "Proposed", "Rejected": "Cancelled", "Executed": "Filled",
+        }
+        src_key = sh.get("Proposal ID")
+        dst_key = dh.get("Proposal ID")
+        if src_key and dst_key:
+            destinations = keyed_rows(dst, dst_key)
+            for src_row in range(6, min(505, src.max_row) + 1):
+                key = src.cell(src_row, src_key).value
+                if key is None or not str(key).strip():
+                    continue
+                key = str(key).strip()
+                dst_row = destinations.get(key) or first_blank_key_row(dst, dst_key)
+                if dst_row is None:
+                    break
+                destinations[key] = dst_row
+                for old_name, src_col in sh.items():
+                    new_name = aliases.get(old_name, old_name)
+                    if new_name not in allowed or new_name not in dh:
+                        continue
+                    value = src.cell(src_row, src_col).value
+                    if value is None or (isinstance(value, str) and value.startswith("=")):
+                        continue
+                    if (new_name == "Thesis Invalidation" and isinstance(value, str) and
+                            value.startswith("Unknown Sharia result")):
+                        # This was v2 generated blocker text, not an owner thesis.
+                        continue
+                    if new_name == "Action":
+                        value = action_map.get(str(value), value)
+                    elif new_name == "Status":
+                        value = status_map.get(str(value), value)
+                    dst.cell(dst_row, dh[new_name]).value = value
+
+    # Performance history is located by its Date header because v2 used row 20
+    # and v3 uses row 30.  Formula-generated opening values are not imported as
+    # owner facts; manually entered values and evidence are.
+    if "Performance" in old.sheetnames and "Performance" in wb.sheetnames:
+        src, dst = old["Performance"], wb["Performance"]
+        src_header = next((r for r in range(1, min(100, src.max_row) + 1)
+                           if src.cell(r, 1).value == "Date"), None)
+        if src_header:
+            dst_row = 31
+            for src_row in range(src_header + 1, min(505, src.max_row) + 1):
+                if all(src.cell(src_row, col).value is None for col in range(1, 10)):
+                    continue
+                for col in (1, 2, 3, 6, 7, 8, 9):
+                    value = src.cell(src_row, col).value
+                    if (col == 9 and isinstance(value, str) and
+                            value.startswith("Opening snapshot; historical cash flows")):
+                        continue
+                    if value is not None and not (isinstance(value, str) and value.startswith("=")):
+                        dst.cell(dst_row, col).value = value
+                dst_row += 1
+
+    # Settings and review history are matched by labels, not row numbers.
+    if "Checks" in old.sheetnames and "Checks" in wb.sheetnames:
+        src, dst = old["Checks"], wb["Checks"]
+        dst_settings = {str(dst.cell(r, 1).value).strip(): r for r in range(5, 21)
+                        if dst.cell(r, 1).value is not None}
+        for src_row in range(5, min(30, src.max_row) + 1):
+            key = src.cell(src_row, 1).value
+            if key is None or str(key).strip() not in dst_settings:
+                continue
+            value = src.cell(src_row, 2).value
+            if value is not None and not (isinstance(value, str) and value.startswith("=")):
+                dst.cell(dst_settings[str(key).strip()], 2).value = value
+        src_review_header = next((r for r in range(30, min(100, src.max_row) + 1)
+                                  if src.cell(r, 1).value == "Review ID"), None)
+        if src_review_header:
+            dst_row = 45
+            for src_row in range(src_review_header + 1, min(505, src.max_row) + 1):
+                if src.cell(src_row, 1).value is None:
+                    continue
+                for col in range(1, 7):
+                    value = src.cell(src_row, col).value
+                    if value is not None:
+                        dst.cell(dst_row, col).value = value
+                dst_row += 1
+    old.close()
+
+
 def sheet_portfolio(wb, holdings):
     ws = wb.create_sheet("Portfolio")
     ws.sheet_view.showGridLines = False
 
-    put(ws, PF_TITLE_ROW, 2, "محفظة الأسهم السعودية — التحليل وحجم المراكز", font=F_TITLE)
+    put(ws, PF_TITLE_ROW, 2, "محفظة Waraqah — السعودية والولايات المتحدة", font=F_TITLE)
     put(ws, PF_NOTE_ROW, 2,
-        "عدّل الخلايا الصفراء فقط (عدد الأسهم ومتوسط التكلفة). باقي الأعمدة معادلات "
-        "تقرأ من ورقة Risk & Horizons. راجع ورقة Guide.",
+        "المراكز والتكلفة مشتقة من Activity. عدّل سجل النشاط فقط؛ التحليل يقرأ من "
+        "Risk & Horizons والضوابط من Sharia وChecks.",
         font=F_NOTE)
 
     headers = [
         "الرمز", "الشركة", "السعر", "عدد الأسهم", "متوسط التكلفة",
         "القيمة السوقية", "التكلفة الإجمالية", "الربح/الخسارة", "نسبة الربح/الخسارة",
-        "الوزن", "النتيجة", "التقييم", "الإشارة",
+        "الوزن", "النتيجة", "التقييم", "الإشارة", "Security ID", "السوق",
+        "العملة", "FX إلى SAR", "تاريخ السعر", "اكتمال البيانات", "الحالة الشرعية",
+        "مراجعة شرعية قادمة", "6 أشهر", "سنتان", "5 سنوات", "مؤهل للشراء؟",
+        "إجراء الوكيل", "العوائق", "رابط المصدر", "حالة الحداثة",
+        "القيمة السوقية بالعملة الأصلية", "التكلفة الأصلية المعروفة",
+        "الربح/الخسارة بالعملة الأصلية", "أثر FX بالريال", "نوع الأداة", "القطاع",
     ]
     header_row(ws, PF_HDR_ROW, 2, headers, font=F_HDR_DARK, fill=FILL_GRAY)
 
@@ -623,13 +910,13 @@ def sheet_portfolio(wb, holdings):
             font=F_VAL, border=B_ALL)
         put(ws, r, 4, f"=IFERROR(VLOOKUP(B{r},'Risk & Horizons'!$A:$D,4,0),\"\")",
             font=F_VAL, fmt=FMT_MONEY, border=B_ALL)
-        put(ws, r, 5, held[1] if held else None,
-            font=F_IN, fill=FILL_IN, fmt=FMT_INT, border=B_ALL)
-        put(ws, r, 6, held[2] if held else None,
-            font=F_IN, fill=FILL_IN, fmt=FMT_MONEY, border=B_ALL)
-        put(ws, r, 7, f'=IF(OR(E{r}="",D{r}=""),"",D{r}*E{r})',
+        put(ws, r, 5, f'=IF(B{r}="","",SUMIF(Activity!$G$6:$G$505,B{r},Activity!$R$6:$R$505))',
+            font=F_VAL, fmt=FMT_INT, border=B_ALL)
+        put(ws, r, 6, f'=IFERROR(SUMIF(Activity!$G$6:$G$505,B{r},Activity!$U$6:$U$505)/E{r},"")',
             font=F_VAL, fmt=FMT_MONEY, border=B_ALL)
-        put(ws, r, 8, f'=IF(OR(E{r}="",F{r}=""),"",E{r}*F{r})',
+        put(ws, r, 7, f'=IF(OR(E{r}="",D{r}="",R{r}=""),"",D{r}*E{r}*R{r})',
+            font=F_VAL, fmt=FMT_MONEY, border=B_ALL)
+        put(ws, r, 8, f'=IF(B{r}="","",SUMIF(Activity!$G$6:$G$505,B{r},Activity!$U$6:$U$505))',
             font=F_VAL, fmt=FMT_MONEY, border=B_ALL)
         put(ws, r, 9, f'=IF(OR(G{r}="",H{r}=""),"",G{r}-H{r})',
             font=F_VAL, fmt=FMT_MONEY, border=B_ALL)
@@ -644,14 +931,57 @@ def sheet_portfolio(wb, holdings):
             font=F_VAL, fmt=FMT_NUM1, border=B_ALL)
         put(ws, r, 13, f"=IFERROR(VLOOKUP(B{r},'Risk & Horizons'!$A:$S,19,0),\"\")",
             font=F_VAL, border=B_ALL)
-        put(ws, r, 14,
-            f'=IF(M{r}="","",IF(M{r}="شراء قوي","دخول قوي",IF(M{r}="شراء","دخول",'
-            f'IF(M{r}="بيع قوي","خروج","احتفاظ/مراجعة"))))',
+        put(ws, r, 14, f'=IF(AA{r}="","",AA{r})', font=F_VAL, border=B_ALL)
+        lookups = {
+            15: (26, None), 16: (27, None), 17: (28, None), 18: (29, FMT_NUM2),
+            19: (23, None), 20: (21, FMT_PCT), 23: (15, None), 24: (16, None),
+            25: (17, None), 29: (25, None), 30: (30, None),
+        }
+        for col, (source_col, fmt) in lookups.items():
+            put(ws, r, col,
+                f'=IFERROR(VLOOKUP(B{r},\'Risk & Horizons\'!$A:$AD,{source_col},FALSE),"")',
+                font=F_VAL, fmt=fmt, border=B_ALL)
+        put(ws, r, 21, f'=IFERROR(VLOOKUP(O{r},Sharia!$A:$W,5,FALSE),"Uncertain")',
+            font=F_VAL, border=B_ALL)
+        put(ws, r, 22, f'=IFERROR(VLOOKUP(O{r},Sharia!$A:$W,12,FALSE),"")',
+            font=F_VAL, border=B_ALL)
+        put(ws, r, 26, f'=IFERROR(VLOOKUP(O{r},Sharia!$A:$W,22,FALSE),"NO")',
+            font=F_VAL, border=B_ALL, align=CENTER)
+        put(ws, r, 27,
+            f'=IF(B{r}="","",IFS(U{r}="Non-compliant","Review Sharia status",'
+            f'U{r}<>"Compliant","Wait — Sharia review",Z{r}<>"YES","Wait — Sharia evidence/expiry",'
+            f'AD{r}<>"Fresh","Wait — stale/unknown data",T{r}<Checks!$B$7,"Wait — incomplete data",'
+            f'OR(Checks!$B$9="",Checks!$B$10="",Checks!$B$11="",'
+            f'IF(Q{r}="SAR",Checks!$B$13,Checks!$B$18)=""),'
+            f'"Review only — limits/cash pending",AND(Checks!$B$10<>"",K{r}>=Checks!$B$10),'
+            f'"Reduce concentration",AND(W{r}="إيجابي",X{r}="إيجابي",Y{r}="إيجابي"),'
+            f'"Research add",AND(W{r}="سلبي",X{r}="سلبي",Y{r}="سلبي"),"Review thesis / risk",'
+            f'TRUE,"Hold / review"))', font=F_VAL, border=B_ALL)
+        put(ws, r, 28,
+            f'=TEXTJOIN("; ",TRUE,IF(U{r}<>"Compliant","Sharia="&U{r},""),'
+            f'IF(Z{r}<>"YES","Sharia evidence/review missing",""),IF(AD{r}<>"Fresh","Data stale/unknown",""),IF(T{r}<Checks!$B$7,"Data incomplete",""),'
+            f'IF(OR(Checks!$B$9="",Checks!$B$10="",Checks!$B$11=""),"Risk limits pending",""),'
+            f'IF(IF(Q{r}="SAR",Checks!$B$13,Checks!$B$18)="","Cash pending",""))',
+            font=F_VAL, border=B_ALL)
+        put(ws, r, 31, f'=IF(OR(D{r}="",E{r}=""),"",D{r}*E{r})',
+            font=F_VAL, fmt=FMT_MONEY, border=B_ALL)
+        put(ws, r, 32, f'=IF(Q{r}="SAR",H{r},"")', font=F_VAL,
+            fmt=FMT_MONEY, border=B_ALL)
+        put(ws, r, 33, f'=IF(OR(AE{r}="",AF{r}=""),"",AE{r}-AF{r})',
+            font=F_VAL, fmt=FMT_MONEY, border=B_ALL)
+        put(ws, r, 34,
+            f'=IF(B{r}="","",IF(Q{r}="SAR",0,"Pending transaction FX history"))',
+            font=F_VAL, border=B_ALL)
+        put(ws, r, 35,
+            f'=IFERROR(VLOOKUP(B{r},\'Risk & Horizons\'!$A:$AU,34,FALSE),"")',
+            font=F_VAL, border=B_ALL)
+        put(ws, r, 36,
+            f'=IFERROR(VLOOKUP(B{r},\'Risk & Horizons\'!$A:$AU,3,FALSE),"")',
             font=F_VAL, border=B_ALL)
 
     # ---- TOTAL row
     put(ws, PF_TOTAL_ROW, 2, "الإجمالي", font=F_TOT, fill=FILL_TOT, border=B_ALL)
-    for col in (3, 4, 5, 6, 12, 13, 14):
+    for col in list(range(3, 7)) + list(range(12, 37)):
         put(ws, PF_TOTAL_ROW, col, None, fill=FILL_TOT, border=B_ALL)
     put(ws, PF_TOTAL_ROW, 7, f"=SUM(G{PF_FIRST_ROW}:G{PF_LAST_ROW})",
         font=F_TOT, fill=FILL_TOT, fmt=FMT_MONEY, border=B_ALL)
@@ -671,7 +1001,9 @@ def sheet_portfolio(wb, holdings):
         (PF_SUM_PL_ROW, "إجمالي الربح/الخسارة", f"=I{PF_TOTAL_ROW}", FMT_MONEY),
         (PF_SUM_MAXW_ROW, "أعلى وزن سهم", f"=MAX(K{first}:K{last})", FMT_PCT),
         (PF_SUM_CONC_ROW, "حالة التركيز",
-         f'=IF(E{PF_SUM_MAXW_ROW}>=0.4,"عالي","مقبول")', None),
+         f'=IF(OR(Checks!$B$9="",Checks!$B$10=""),"الحدود معلّقة",'
+         f'IF(E{PF_SUM_MAXW_ROW}>=Checks!$B$10,"فوق الحد الصارم",'
+         f'IF(E{PF_SUM_MAXW_ROW}>=Checks!$B$9,"فوق الحد المرن","ضمن الحدود")))', None),
         (PF_SUM_R1_ROW, "عدد «شراء قوي»", f'=COUNTIF(M{first}:M{last},"شراء قوي")', FMT_INT),
         (PF_SUM_R2_ROW, "عدد «شراء»", f'=COUNTIF(M{first}:M{last},"شراء")', FMT_INT),
         (PF_SUM_R3_ROW, "عدد «تعزيز/احتفاظ»",
@@ -689,7 +1021,11 @@ def sheet_portfolio(wb, holdings):
 
     set_widths(ws, {
         "A": 3, "B": 11, "C": 30, "D": 11, "E": 12, "F": 14, "G": 16,
-        "H": 16, "I": 15, "J": 13, "K": 10, "L": 10, "M": 14, "N": 15,
+        "H": 16, "I": 15, "J": 13, "K": 10, "L": 10, "M": 14, "N": 22,
+        "O": 15, "P": 12, "Q": 10, "R": 11, "S": 13, "T": 14, "U": 16,
+        "V": 16, "W": 15, "X": 15, "Y": 15, "Z": 14, "AA": 25,
+        "AB": 44, "AC": 40, "AD": 20,
+        "AE": 24, "AF": 24, "AG": 24, "AH": 28, "AI": 16, "AJ": 22,
     })
     set_filter(ws, PF_HDR_ROW, PF_LAST_ROW, 1 + len(headers))
     ws.freeze_panes = "A6"      # rows 1-5 stay visible
@@ -802,9 +1138,9 @@ def sheet_lookup(wb, rows):
     section(SL_VERDICT_HDR_ROW, SL_VERDICT_FIRST_ROW, "الحكم", [
         ("النتيجة المركبة (0-100)", rh(18, FMT_NUM1)),
         ("التقييم", rh(19)),
-        ("حكم قريب (1-3 أشهر)", rh(15)),
-        ("حكم متوسط (6-18 شهر)", rh(16)),
-        ("حكم بعيد (3 سنوات فأكثر)", rh(17)),
+        ("حكم قصير (6 أشهر)", rh(15)),
+        ("حكم متوسط (سنتان)", rh(16)),
+        ("حكم طويل (5 سنوات)", rh(17)),
     ])
     note_row = SL_VERDICT_FIRST_ROW + 5
     put(ws, note_row, 2, "ملاحظة", font=F_LBL, align=RIGHT, border=B_ALL)
@@ -830,13 +1166,19 @@ def sheet_risk(wb, rows):
         "الرمز", "الشركة", "القطاع", "السعر",
         "عائد أسبوع", "عائد شهر", "عائد 3 أشهر", "عائد 6 أشهر", "عائد سنة",
         "RSI(14)", "نظام التقلب", "مقابل SMA200", "أقصى تراجع سنتين",
-        "بيتا النفط", "حكم قريب", "حكم متوسط", "حكم بعيد", "النتيجة", "التقييم",
+        "بيتا النفط", "6 أشهر", "سنتان", "5 سنوات", "النتيجة", "التقييم",
+        "اتجاه التقلب", "اكتمال البيانات", "قابل للإجراء", "تاريخ السعر",
+        "المصدر", "رابط المصدر", "المعرف", "السوق", "العملة", "FX إلى SAR", "حالة الحداثة",
+        "تقويم السوق", "التسوية", "فترة القوائم", "نوع الأداة", "توقيت السوق",
+        "جلسة السوق", "معالجة التوقيت الصيفي", "قاعدة الكمية", "قواعد الأوامر",
+        "أساس القوائم", "تاريخ النشر", "وقت الملاحظة", "وقت الجلب",
+        "أساس السعر", "أساس العائد", "وحدة التوزيعات", "مصدر قواعد السوق",
     ]
     header_row(ws, RH_HDR_ROW, 1, headers)
 
     fmts = {
         4: FMT_MONEY, 5: FMT_PCT, 6: FMT_PCT, 7: FMT_PCT, 8: FMT_PCT, 9: FMT_PCT,
-        10: FMT_NUM1, 13: FMT_PCT, 18: FMT_NUM1,
+        10: FMT_NUM1, 13: FMT_PCT, 18: FMT_NUM1, 21: FMT_PCT, 29: FMT_NUM2,
     }
     for i, rec in enumerate(rows):
         r = RH_FIRST_ROW + i
@@ -845,7 +1187,16 @@ def sheet_risk(wb, rows):
             rec["ret_1w"], rec["ret_1m"], rec["ret_3m"], rec["ret_6m"], rec["ret_1y"],
             rec["rsi"], rec["vol_regime"], rec["sma200"], rec["maxdd_2y"],
             rec["oil_beta"], rec["near"], rec["mid"], rec["far"],
-            rec["score"], rec["rating"],
+            rec["score"], rec["rating"], rec["vol_trend"], rec["completeness"],
+            "نعم" if rec["actionable"] else "لا", rec["data_as_of"], rec["source"],
+            rec["source_url"], rec["security_id"], rec["exchange"], rec["currency"],
+            rec["fx_to_sar"], rec["freshness"], rec["market_calendar"],
+            rec["settlement"], rec["fundamentals_period"], rec["instrument_type"],
+            rec["market_timezone"], rec["market_session"], rec["dst_handling"],
+            rec["quantity_rule"], rec["order_rule"], rec["fundamentals_basis"],
+            rec["publication_date"], rec["observation_time"], rec["retrieval_time"],
+            rec["price_basis"], rec["return_basis"], rec["dividend_unit"],
+            rec["market_rule_source"],
         ]
         for col, value in enumerate(values, start=1):
             put(ws, r, col, value, font=F_STAT, border=B_ALL,
@@ -855,7 +1206,12 @@ def sheet_risk(wb, rows):
     set_widths(ws, {
         "A": 9, "B": 28, "C": 22, "D": 10, "E": 11, "F": 11, "G": 11, "H": 11,
         "I": 11, "J": 9, "K": 12, "L": 13, "M": 15, "N": 11, "O": 18, "P": 18,
-        "Q": 18, "R": 9, "S": 14,
+        "Q": 18, "R": 9, "S": 14, "T": 12, "U": 14, "V": 12,
+        "W": 13, "X": 18, "Y": 36, "Z": 14, "AA": 12, "AB": 10,
+        "AC": 10, "AD": 20, "AE": 18, "AF": 12, "AG": 14, "AH": 14,
+        "AI": 20, "AJ": 28, "AK": 28, "AL": 32, "AM": 36, "AN": 34,
+        "AO": 18, "AP": 20, "AQ": 24, "AR": 34, "AS": 34, "AT": 22,
+        "AU": 42,
     })
     set_filter(ws, RH_HDR_ROW, RH_FIRST_ROW + len(rows) - 1, len(headers))
     ws.freeze_panes = "A5"
@@ -871,11 +1227,11 @@ def sheet_db(wb, data, rows):
     ws.sheet_view.showGridLines = False
     put(ws, DB_TITLE_ROW, 1,
         "قاعدة البيانات — صف لكل (رمز، سنة). الرموز تصاعدياً، والسنوات تنازلياً "
-        "داخل كل رمز (الأحدث أولاً).", font=F_TITLE)
+        "داخل كل رمز. العائد من إغلاق معدل والتوزيعات نقد/سهم بعملة الإدراج.", font=F_TITLE)
 
     headers = [
-        "الرمز", "السنة", "الإغلاق", "العائد السنوي", "التقلب السنوي",
-        "أقصى تراجع", "التوزيعات (ريال)", "عائد التوزيعات", "زخم 12-1",
+        "الرمز", "السنة", "الإغلاق المعدل", "العائد الإجمالي السنوي", "التقلب السنوي",
+        "أقصى تراجع", "التوزيعات (عملة الإدراج/سهم)", "عائد التوزيعات", "زخم 12-1 (آخر شهر مستبعد)",
         "ربحية السهم", "مكرر الربحية", "ROE", "النتيجة", "التقييم",
         "مفتاح النقص", "مفتاح السنة", "مفتاح الأحدث", "نسبة التوزيع",
     ]
@@ -1049,78 +1405,621 @@ def sheet_symbols(wb, rows):
 
 
 # --------------------------------------------------------------------------
+# Personal-book control sheets
+# --------------------------------------------------------------------------
+
+def _list_validation(ws, cell_range, values):
+    validation = DataValidation(type="list", formula1='"%s"' % ",".join(values),
+                                allow_blank=True)
+    validation.error = "اختر قيمة من القائمة"
+    validation.errorTitle = "قيمة غير صالحة"
+    validation.prompt = "استخدم القائمة المنسدلة للحفاظ على سجل قابل للتدقيق"
+    validation.promptTitle = "Waraqah"
+    validation.showErrorMessage = True
+    validation.showInputMessage = True
+    ws.add_data_validation(validation)
+    validation.add(cell_range)
+
+
+def sheet_activity(wb, holdings):
+    """Auditable transaction ledger; Portfolio positions derive from this sheet."""
+    ws = wb.create_sheet("Activity")
+    ws.sheet_view.showGridLines = False
+    put(ws, 2, 1, "سجل النشاط — المصدر المحاسبي الوحيد للمراكز والنقد", font=F_TITLE)
+    put(ws, 3, 1,
+        "أدخل كل صف مرة واحدة بمعرّف ثابت. أرصدة الافتتاح تحفظ المراكز الحالية فقط؛ "
+        "تواريخ الشراء الأصلية تظل معلّقة حتى استيراد كشف الوسيط.", font=F_NOTE)
+    headers = [
+        "Transaction ID", "Trade Date", "Settlement Date", "Account", "Broker",
+        "Security ID", "Ticker", "Exchange", "Type", "Quantity", "Price",
+        "Currency", "FX to SAR", "Fees", "Tax / Withholding", "Cash Amount", "Broker Reference",
+        "Signed Qty", "Qty Before", "Cost Basis Before SAR", "Cost Basis Change SAR",
+        "Realized P/L SAR", "Cash Change Original", "Cash Change SAR", "Source",
+        "Imported At", "Duplicate?", "Notes",
+    ]
+    header_row(ws, 5, 1, headers)
+
+    for idx, held in enumerate(holdings):
+        r = 6 + idx
+        code, shares, cost = held
+        values = [
+            "OPEN-SA-%s-20260909" % code, None, None, "Pending", "Pending",
+            "SA-%s" % code, code, "Tadawul", "Opening balance", shares, cost,
+            "SAR", 1.0, 0.0, 0.0, None, None,
+        ]
+        for col, value in enumerate(values, 1):
+            put(ws, r, col, value, font=F_IN if col <= 17 else F_VAL,
+                fill=FILL_IN if col <= 17 else None, border=B_ALL,
+                fmt=FMT_TEXT if col in (1, 6, 7, 12, 17) else None,
+                align=CENTER)
+        put(ws, r, 25, "Original Portfolio opening balance; acquisition date unknown",
+            font=F_NOTE, border=B_ALL)
+        put(ws, r, 26, "2026-09-09", font=F_VAL, border=B_ALL)
+        put(ws, r, 28, "Book opening snapshot — not an asserted trade date",
+            font=F_NOTE, border=B_ALL)
+
+    for r in range(6, 506):
+        put(ws, r, 18,
+            f'=IF(F{r}="","",IF(OR(I{r}="Opening balance",I{r}="Buy",I{r}="Transfer in"),J{r},'
+            f'IF(OR(I{r}="Sell",I{r}="Transfer out"),-J{r},IF(I{r}="Split",S{r}*(J{r}-1),0))))',
+            font=F_VAL, fmt=FMT_NUM2, border=B_ALL)
+        before_qty = "0" if r == 6 else f'SUMIF($F$6:F{r-1},F{r},$R$6:R{r-1})'
+        before_cost = "0" if r == 6 else f'SUMIF($F$6:F{r-1},F{r},$U$6:U{r-1})'
+        put(ws, r, 19, f'=IF(F{r}="","",{before_qty})', font=F_VAL,
+            fmt=FMT_NUM2, border=B_ALL)
+        put(ws, r, 20, f'=IF(F{r}="","",{before_cost})', font=F_VAL,
+            fmt=FMT_MONEY, border=B_ALL)
+        put(ws, r, 21,
+            f'=IF(F{r}="","",IF(OR(I{r}="Opening balance",I{r}="Buy",I{r}="Transfer in"),'
+            f'(J{r}*K{r}+N{r}+O{r})*M{r},IF(OR(I{r}="Sell",I{r}="Transfer out"),'
+            f'-IFERROR(J{r}*T{r}/S{r},0),0)))', font=F_VAL, fmt=FMT_MONEY, border=B_ALL)
+        put(ws, r, 22,
+            f'=IF(A{r}="","",IF(I{r}="Sell",(J{r}*K{r}-N{r}-O{r})*M{r}+U{r},0))',
+            font=F_VAL, fmt=FMT_MONEY, border=B_ALL)
+        put(ws, r, 23,
+            f'=IF(A{r}="","",IF(I{r}="Buy",-(J{r}*K{r}+N{r}+O{r}),'
+            f'IF(I{r}="Sell",J{r}*K{r}-N{r}-O{r},IF(OR(I{r}="Deposit",I{r}="Dividend"),'
+            f'P{r}-N{r}-O{r},IF(I{r}="FX buy",P{r}-N{r}-O{r},'
+            f'IF(I{r}="Corporate action",P{r}-N{r}-O{r},'
+            f'IF(OR(I{r}="Withdrawal",I{r}="Fee",I{r}="Tax",I{r}="Withholding",I{r}="FX sell"),'
+            f'-(P{r}+N{r}+O{r}),0)))))))', font=F_VAL, fmt=FMT_MONEY, border=B_ALL)
+        put(ws, r, 24, f'=IF(W{r}="","",W{r}*M{r})', font=F_VAL,
+            fmt=FMT_MONEY, border=B_ALL)
+        put(ws, r, 27, f'=IF(A{r}="","",IF(COUNTIF($A$6:$A$505,A{r})>1,"DUPLICATE","OK"))',
+            font=F_VAL, border=B_ALL, align=CENTER)
+
+    _list_validation(ws, "H6:H505", ["Tadawul", "NYSE", "NASDAQ", "Other"])
+    _list_validation(ws, "I6:I505", [
+        "Opening balance", "Buy", "Sell", "Dividend", "Fee", "Tax", "Withholding", "Deposit",
+        "Withdrawal", "Transfer in", "Transfer out", "Split", "Corporate action",
+        "FX buy", "FX sell",
+    ])
+    _list_validation(ws, "L6:L505", ["SAR", "USD"])
+    widths = {get_column_letter(i): 14 for i in range(1, len(headers) + 1)}
+    widths.update({"A": 24, "D": 16, "E": 16, "F": 15, "I": 18, "Q": 20,
+                   "Y": 35, "Z": 18, "AB": 38})
+    set_widths(ws, widths)
+    set_filter(ws, 5, 505, len(headers))
+    ws.freeze_panes = "A6"
+    return ws
+
+
+def sheet_sharia(wb, holdings, rows):
+    """Evidence ledger and hard eligibility gate for new purchases."""
+    ws = wb.create_sheet("Sharia")
+    ws.sheet_view.showGridLines = False
+    put(ws, 2, 1, "الضوابط الشرعية — لا شراء من دون دليل ساري", font=F_TITLE)
+    put(ws, 3, 1,
+        "المنهجية/الجهة ما زالت معلّقة بانتظار اختيار المالك. لذلك تبدأ جميع المراكز "
+        "بحالة Uncertain ويُحظر أي اقتراح شراء تلقائياً.", font=F_NOTE)
+    headers = [
+        "Security ID", "Ticker", "Company", "Exchange", "Status",
+        "Authority / Provider", "Methodology", "Methodology Version", "Evidence URL",
+        "Reporting Period", "Screen Date", "Next Review", "Business Activity Evidence",
+        "Financial Ratio Evidence", "Purification Method", "Purification Due SAR",
+        "Purification Paid SAR", "Payment Date", "Change Since Prior Review", "Reviewer",
+        "Notes", "Buy Eligible?", "Holding Review Flag",
+    ]
+    header_row(ws, 5, 1, headers)
+    by_code = {row["code"]: row for row in rows}
+    for idx, held in enumerate(holdings):
+        r = 6 + idx
+        code = held[0]
+        rec = by_code.get(code) or {}
+        values = [
+            "SA-" + code, code, rec.get("name") or code, "Tadawul", "Uncertain",
+            "Pending owner selection", "Pending owner selection",
+            "Pending owner selection", None, None, None, None, "Pending evidence",
+            "Pending evidence", "Pending methodology", None, None, None,
+            "No prior verified screen", "Codex",
+            "Initial control row; no Sharia conclusion made",
+        ]
+        for col, value in enumerate(values, 1):
+            put(ws, r, col, value, font=F_IN if col in range(5, 22) else F_VAL,
+                fill=FILL_IN if col in range(5, 22) else None, border=B_ALL,
+                fmt=(FMT_TEXT if col in (1, 2, 9) else
+                     (FMT_MONEY if col in (16, 17) else None)), align=CENTER)
+    for r in range(6, 506):
+        put(ws, r, 22,
+            f'=IF(A{r}="","",IF(AND(E{r}="Compliant",F{r}<>"",G{r}<>"",H{r}<>"",'
+            f'I{r}<>"",J{r}<>"",K{r}<>"",L{r}>=TODAY(),M{r}<>"",N{r}<>""),"YES","NO"))',
+            font=F_VAL, border=B_ALL, align=CENTER)
+        put(ws, r, 23,
+            f'=IF(A{r}="","",IF(OR(E{r}="Non-compliant",E{r}="Review overdue"),'
+            f'"Review required — no disposal instruction inferred",'
+            f'IF(E{r}="Uncertain","Evidence required",'
+            f'IF(AND(S{r}<>"",S{r}<>"No change"),"Change review required","Current"))))',
+            font=F_VAL, border=B_ALL, align=CENTER)
+    _list_validation(ws, "E6:E505", ["Compliant", "Non-compliant", "Uncertain", "Review overdue"])
+    widths = {get_column_letter(i): 16 for i in range(1, len(headers) + 1)}
+    widths.update({
+        "A": 15, "C": 30, "F": 24, "G": 24, "H": 20, "I": 42, "J": 20,
+        "M": 34, "N": 34, "O": 30, "S": 28, "U": 42, "W": 24,
+    })
+    set_widths(ws, widths)
+    set_filter(ws, 5, 505, len(headers))
+    ws.freeze_panes = "A6"
+    return ws
+
+
+def _metric_text(value, percent=False):
+    if value is None:
+        return "N/A"
+    if percent:
+        return "%.1f%%" % (float(value) * 100.0)
+    return "%.2f" % float(value)
+
+
+def _metric_percentage_points(value):
+    """Format a metric already stored in percentage points without `N/A%`."""
+    if value is None:
+        return "N/A"
+    return "%.2f%%" % float(value)
+
+
+def _review_thesis(rec, horizon):
+    """Auditable quantitative review text; intentionally makes no forecast."""
+    if horizon == "6 months":
+        return (
+            "6-month view=%s; 3m return=%s; 6m return=%s; RSI=%s; "
+            "volatility level=%s and trend=%s; SMA200=%s. Descriptive only; "
+            "no trade until Sharia evidence and owner controls pass."
+        ) % (rec.get("near") or "N/A", _metric_text(rec.get("ret_3m"), True),
+             _metric_text(rec.get("ret_6m"), True), _metric_text(rec.get("rsi")),
+             rec.get("vol_regime") or "N/A", rec.get("vol_trend") or "N/A",
+             rec.get("sma200") or "N/A")
+    if horizon == "2 years":
+        return (
+            "2-year view=%s; 1y total return=%s; 12-1 momentum=%s; "
+            "max drawdown 2y=%s; P/E=%s; completeness=%s. Evidence refresh "
+            "required before any non-Wait proposal."
+        ) % (rec.get("mid") or "N/A", _metric_text(rec.get("ret_1y"), True),
+             _metric_text(rec.get("momentum"), True), _metric_text(rec.get("maxdd_2y"), True),
+             _metric_text(rec.get("pe")), _metric_text(rec.get("completeness"), True))
+    return (
+        "5-year view=%s; ROE=%s; dividend yield=%s; payout=%s; P/E=%s. "
+        "These are latest/trailing inputs, not a five-year forecast; official "
+        "filings and Sharia evidence are still required."
+    ) % (rec.get("far") or "N/A", _metric_percentage_points(rec.get("roe")),
+         _metric_percentage_points(rec.get("div_yield")), _metric_text(rec.get("payout")),
+         _metric_text(rec.get("pe")))
+
+
+def _horizon_framework(horizon):
+    """Research lens text that states what remains to be evidenced."""
+    if horizon == "6 months":
+        return {
+            "rationale": (
+                "Review the 6-month trend, valuation, trading liquidity and event risk around "
+                "verified earnings or corporate announcements; a favorable score alone is not an order."
+            ),
+            "entry": "Pending verified catalyst, valuation range, liquidity and owner-approved limits",
+            "catalyst": "Next earnings or declared corporate action; event and date pending verification",
+            "downside": "Bear case must test weak earnings, adverse event risk and a trend break; magnitude pending evidence",
+            "triggers": "Re-review after earnings/corporate news, material valuation change, liquidity deterioration or trend break",
+        }
+    if horizon == "2 years":
+        return {
+            "rationale": (
+                "Review earnings and cash-flow development, debt, execution milestones and sector-appropriate "
+                "valuation scenarios over two years."
+            ),
+            "entry": "Pending verified financial path, debt capacity, milestones and owner-approved limits",
+            "catalyst": "Earnings, cash-flow, debt and execution milestones pending verified filings",
+            "downside": "Bear case must test missed milestones, weaker cash conversion and balance-sheet stress",
+            "triggers": "Re-review on material guidance, debt, cash-flow or execution-milestone changes",
+        }
+    return {
+        "rationale": (
+            "Review competitive position, reinvestment, returns on capital, dilution, governance and "
+            "long-term valuation sensitivity over five years."
+        ),
+        "entry": "Pending verified durable economics, governance review and long-term valuation sensitivity",
+        "catalyst": "Competitive, reinvestment and governance evidence from future verified filings",
+        "downside": "Bear case must test structural competition, poor reinvestment, dilution and governance deterioration",
+        "triggers": "Re-review on structural moat, capital-allocation, dilution, governance or return-on-capital changes",
+    }
+
+
+def sheet_orders(wb, holdings, rows):
+    """Ranked, versioned proposal queue.  It never sends orders to a broker."""
+    ws = wb.create_sheet("Orders")
+    ws.sheet_view.showGridLines = False
+    put(ws, 2, 1, "اقتراحات الأوامر — للمراجعة البشرية فقط", font=F_TITLE)
+    put(ws, 3, 1,
+        "Codex يحدّث البحث والمقترحات فقط. لا توجد وصلة تنفيذ، ولمس السعر لا يثبت التعبئة؛ "
+        "فقط تعبئة مؤكدة من الوسيط ومعرّف Activity تغيّر السجل الفعلي.", font=F_NOTE)
+    headers = [
+        "Proposal ID", "Version", "Rank", "Created At", "Reviewed At", "Horizon",
+        "Security ID", "Ticker", "Company", "Exchange", "Broker", "Account", "Currency",
+        "Action", "Order Type", "Entry Condition", "Proposed Quantity", "Limit Price",
+        "Stop / Review Price", "Valid Until", "Thesis / Rationale", "Facts",
+        "Estimates / Scenarios", "Agent Judgment", "Evidence URLs", "Catalyst",
+        "Downside Scenario", "Review / Exit Triggers", "Why I Own It", "Thesis Invalidation",
+        "Current Position %", "Proposed Position %", "Proposed Sector %",
+        "Cash Impact Original", "Cash Impact SAR", "Cash After SAR", "Sizing Assumptions",
+        "Horizon Reconciliation", "Sharia Status", "Sharia Evidence", "Data Freshness",
+        "Blockers", "Confidence", "Status", "User Decision", "Decision Date",
+        "Broker Order ID", "Filled Quantity", "Average Fill Price",
+        "Execution Transaction ID", "Review ID", "Analysis Version", "Last Checked", "Notes",
+        "Duplicate?", "Execution Control", "Horizon Conflict?",
+    ]
+    header_row(ws, 5, 1, headers)
+    by_code = {row["code"]: row for row in rows}
+    horizons = ["6 months", "2 years", "5 years"]
+    current_row = 6
+    rank = 1
+    for held in holdings:
+        code = held[0]
+        rec = by_code.get(code) or {}
+        for horizon in horizons:
+            r = current_row
+            framework = _horizon_framework(horizon)
+            proposal = "REV-%s-SA-%s-%s" % (BOOK_BUILD_ID_DATE, code, horizon.split()[0])
+            security_id = rec.get("security_id") or ("SA-" + code)
+            exchange = rec.get("exchange") or "Tadawul"
+            currency = rec.get("currency") or "SAR"
+            values = [
+                proposal, 1, rank, BOOK_BUILD_DATE, BOOK_BUILD_DATE, horizon,
+                security_id, code, rec.get("name") or code, exchange, None, None, currency,
+                "Wait", "No order", framework["entry"], None, None, None, None,
+                framework["rationale"], _review_thesis(rec, horizon),
+                "Bear/base/bull assumptions pending verified forward evidence; no target price invented",
+                "Wait — Sharia method/evidence, cash, broker and owner risk limits are unresolved",
+                rec.get("source_url"), framework["catalyst"], framework["downside"],
+                framework["triggers"], "Pending owner thesis", "Pending owner invalidation criteria",
+                None, None, None, None, None, None,
+                "Quantity remains pending until cash, exposure, pending orders, broker rules and risk limits are known",
+                "One shared position, three research lenses; at most one active executable order per ticker",
+                None, None, None, None, "Low", "Proposed", None, None, None, None, None,
+                None, "REVIEW-%s-INITIAL" % BOOK_BUILD_ID_DATE, "WARAQAH-3.0",
+                BOOK_BUILD_DATE, "No trade instruction; controlled Wait outcome", None, None, None,
+            ]
+            for col, value in enumerate(values, 1):
+                is_input = col in ({12} | set(range(14, 21)) | {29, 30} |
+                                   set(range(44, 55)))
+                put(ws, r, col, value, font=F_IN if is_input else F_VAL,
+                    fill=FILL_IN if is_input else None,
+                    border=B_ALL, align=CENTER,
+                    fmt=(FMT_TEXT if col in (1, 7, 8, 25, 47, 50, 51, 52) else
+                         (FMT_PCT if col in (31, 32, 33) else
+                          (FMT_MONEY if col in (18, 19, 34, 35, 36, 49) else None))))
+            current_row += 1
+            rank += 1
+    for r in range(6, 506):
+        put(ws, r, 11,
+            f'=IF(G{r}="","",IF(J{r}="Tadawul",Checks!$B$12,'
+            f'IF(OR(J{r}="NYSE",J{r}="NASDAQ"),Checks!$B$14,"")))',
+            font=F_VAL, border=B_ALL)
+        put(ws, r, 31,
+            f'=IF(H{r}="","",IFERROR(VLOOKUP(H{r},Portfolio!$B:$K,10,FALSE),""))',
+            font=F_VAL, fmt=FMT_PCT, border=B_ALL)
+        put(ws, r, 34,
+            f'=IF(OR(N{r}="Hold",N{r}="Wait"),0,IF(OR(H{r}="",Q{r}=""),"",'
+            f'IF(OR(N{r}="Buy",N{r}="Add"),-Q{r}*IF(R{r}<>"",R{r},'
+            f'IFERROR(VLOOKUP(H{r},\'Risk & Horizons\'!$A:$D,4,FALSE),"")),'
+            f'IF(OR(N{r}="Trim",N{r}="Exit"),Q{r}*IF(R{r}<>"",R{r},'
+            f'IFERROR(VLOOKUP(H{r},\'Risk & Horizons\'!$A:$D,4,FALSE),"")),0))))',
+            font=F_VAL, fmt=FMT_MONEY, border=B_ALL)
+        put(ws, r, 35,
+            f'=IF(AH{r}="","",AH{r}*IFERROR(VLOOKUP(H{r},'
+            f'\'Risk & Horizons\'!$A:$AC,29,FALSE),""))',
+            font=F_VAL, fmt=FMT_MONEY, border=B_ALL)
+        put(ws, r, 32,
+            f'=IF(H{r}="","",IF(OR(N{r}="Hold",N{r}="Wait"),AE{r},'
+            f'IF(AI{r}="","",IFERROR((VLOOKUP(H{r},Portfolio!$B:$G,6,FALSE)-AI{r})/'
+            f'Portfolio!$G$26,""))))',
+            font=F_VAL, fmt=FMT_PCT, border=B_ALL)
+        put(ws, r, 33,
+            f'=IF(H{r}="","",IFERROR(SUMIF(Portfolio!$AJ$6:$AJ$25,'
+            f'VLOOKUP(H{r},\'Risk & Horizons\'!$A:$C,3,FALSE),Portfolio!$G$6:$G$25)/'
+            f'Portfolio!$G$26+IF(OR(N{r}="Hold",N{r}="Wait"),0,'
+            f'IF(AI{r}="","",-AI{r}/Portfolio!$G$26)),""))',
+            font=F_VAL, fmt=FMT_PCT, border=B_ALL)
+        base_cash = (
+            f'IF(M{r}="SAR",Checks!$B$13,IF(M{r}="USD",Checks!$B$18*'
+            f'IFERROR(VLOOKUP(H{r},\'Risk & Horizons\'!$A:$AC,29,FALSE),""),""))'
+        )
+        put(ws, r, 36,
+            f'=IF({base_cash}="","",{base_cash}+'
+            f'SUMIFS($AI$6:$AI$505,$AR$6:$AR$505,"Approved")+'
+            f'SUMIFS($AI$6:$AI$505,$AR$6:$AR$505,"Submitted")+'
+            f'SUMIFS($AI$6:$AI$505,$AR$6:$AR$505,"Part-filled"))',
+            font=F_VAL, fmt=FMT_MONEY, border=B_ALL)
+        put(ws, r, 39,
+            f'=IF(G{r}="","",IFERROR(VLOOKUP(G{r},Sharia!$A:$W,5,FALSE),"Uncertain"))',
+            font=F_VAL, border=B_ALL)
+        put(ws, r, 40,
+            f'=IF(G{r}="","",IFERROR(VLOOKUP(G{r},Sharia!$A:$W,9,FALSE),""))',
+            font=F_VAL, border=B_ALL)
+        put(ws, r, 41,
+            f'=IF(H{r}="","",IFERROR(VLOOKUP(H{r},\'Risk & Horizons\'!$A:$AD,30,FALSE),"Unknown"))',
+            font=F_VAL, border=B_ALL)
+        executable = (
+            f'OR(N{r}="Buy",N{r}="Add",N{r}="Trim",N{r}="Exit")'
+        )
+        potential_buy = f'OR(N{r}="Buy",N{r}="Add",N{r}="Wait")'
+        put(ws, r, 42,
+            f'=IF(G{r}="","",TEXTJOIN("; ",TRUE,'
+            f'IF(AND({potential_buy},IFERROR(VLOOKUP(G{r},Sharia!$A:$W,22,FALSE),"NO")<>"YES"),"Sharia gate not passed",""),'
+            f'IF(AND({potential_buy},AN{r}=""),"Sharia evidence missing",""),'
+            f'IF(AO{r}<>"Fresh","Data stale/unknown",""),'
+            f'IF(IFERROR(VLOOKUP(H{r},\'Risk & Horizons\'!$A:$U,21,FALSE),0)<Checks!$B$7,"Data incomplete",""),'
+            f'IF(OR(Checks!$B$9="",Checks!$B$10="",Checks!$B$11=""),"Risk limits pending",""),'
+            f'IF(AND(OR({executable},N{r}="Wait"),K{r}=""),"Broker pending",""),'
+            f'IF(AND({executable},OR(Q{r}="",O{r}="",O{r}="No order")),"Executable terms incomplete",""),'
+            f'IF(AND({potential_buy},IF(M{r}="SAR",Checks!$B$13,Checks!$B$18)=""),"Cash balance pending",""),'
+            f'IF(AND(AJ{r}<>"",AJ{r}<0),"Negative cash after commitments",""),'
+            f'IF(AND(OR(N{r}="Buy",N{r}="Add"),AF{r}<>"",Checks!$B$10<>"",AF{r}>Checks!$B$10),"Position hard limit breached",""),'
+            f'IF(AND(OR(N{r}="Buy",N{r}="Add"),AG{r}<>"",Checks!$B$11<>"",AG{r}>Checks!$B$11),"Sector limit breached",""),'
+            f'IF(OR(AC{r}="",LEFT(AC{r},7)="Pending"),"Owner thesis pending",""),'
+            f'IF(OR(AD{r}="",LEFT(AD{r},7)="Pending"),"Invalidation criteria pending",""),'
+            f'IF(AL{r}="","Horizon reconciliation missing","")))',
+            font=F_VAL, border=B_ALL)
+        put(ws, r, 55,
+            f'=IF(A{r}="","",IF(COUNTIFS($A$6:$A$505,A{r},$B$6:$B$505,B{r})>1,'
+            f'"DUPLICATE","OK"))', font=F_VAL, border=B_ALL, align=CENTER)
+        put(ws, r, 56,
+            f'=IF(A{r}="","",IF(OR(AR{r}="Filled",AR{r}="Part-filled"),'
+            f'IF(AND(AU{r}<>"",AV{r}>0,AW{r}>0,AX{r}<>""),"OK","MISSING FILL EVIDENCE"),'
+            f'IF(AR{r}="Submitted",IF(AU{r}<>"","OK","MISSING BROKER ORDER ID"),'
+            f'IF(AX{r}<>"","INVALID ACTIVITY LINK","OK"))))',
+            font=F_VAL, border=B_ALL, align=CENTER)
+        put(ws, r, 57,
+            f'=IF(H{r}="","",IF(COUNTIFS($H$6:$H$505,H{r},$AR$6:$AR$505,"Approved")+'
+            f'COUNTIFS($H$6:$H$505,H{r},$AR$6:$AR$505,"Submitted")+'
+            f'COUNTIFS($H$6:$H$505,H{r},$AR$6:$AR$505,"Part-filled")>1,'
+            f'"CONFLICT","OK"))', font=F_VAL, border=B_ALL, align=CENTER)
+    _list_validation(ws, "F6:F505", horizons)
+    _list_validation(ws, "N6:N505", ["Buy", "Add", "Hold", "Trim", "Exit", "Wait"])
+    _list_validation(ws, "O6:O505", ["Limit", "Stop", "Stop limit", "Market", "No order"])
+    _list_validation(ws, "AQ6:AQ505", ["Low", "Medium", "High"])
+    _list_validation(ws, "AR6:AR505", [
+        "Proposed", "Approved", "Submitted", "Part-filled", "Filled",
+        "Cancelled", "Expired", "Superseded",
+    ])
+    _list_validation(ws, "AS6:AS505", ["Approve", "Reject", "Modify", "Defer"])
+    widths = {get_column_letter(i): 15 for i in range(1, len(headers) + 1)}
+    widths.update({
+        "A": 28, "D": 14, "E": 14, "I": 28, "P": 34, "U": 48, "V": 52,
+        "W": 44, "X": 44, "Y": 40, "Z": 36, "AA": 42, "AB": 42,
+        "AC": 32, "AD": 34, "AK": 46, "AL": 46, "AN": 40, "AP": 52,
+        "AU": 24, "AX": 28, "AY": 25, "AZ": 18, "BB": 40, "BD": 28,
+        "BE": 24,
+    })
+    set_widths(ws, widths)
+    set_filter(ws, 5, 505, len(headers))
+    ws.freeze_panes = "A6"
+    return ws
+
+
+def sheet_performance(wb):
+    ws = wb.create_sheet("Performance")
+    ws.sheet_view.showGridLines = False
+    put(ws, 2, 1, "الأداء — العائد المحقق وغير المحقق والتدفقات", font=F_TITLE)
+    put(ws, 3, 1,
+        "الأداء الفعلي منفصل عن المقترحات والمحاكاة. لا تُحسب الإيداعات أرباحاً، ولا "
+        "يُعرض TWR أو XIRR أو التراجع قبل اكتمال السجل المؤرخ.", font=F_NOTE)
+    header_row(ws, 5, 1, ["Metric", "Value", "Notes"])
+    metrics_rows = [
+        ("Portfolio value SAR", "=Portfolio!G26", "Current open-position market value", FMT_MONEY),
+        ("Cost basis SAR", "=Portfolio!H26", "Open-position cost basis including recorded purchase costs", FMT_MONEY),
+        ("Unrealized P/L SAR", "=Portfolio!I26", "Current value minus open-position cost basis", FMT_MONEY),
+        ("Realized P/L SAR", "=SUM(Activity!V6:V505)", "Weighted-average method; trade costs already included once", FMT_MONEY),
+        ("Net dividends SAR", '=SUMIFS(Activity!X6:X505,Activity!I6:I505,"Dividend")',
+         "Dividend cash net of fees and withholding entered on the dividend row", FMT_MONEY),
+        ("Standalone fees / tax cash SAR",
+         '=SUMIFS(Activity!X6:X505,Activity!I6:I505,"Fee")+SUMIFS(Activity!X6:X505,Activity!I6:I505,"Tax")+SUMIFS(Activity!X6:X505,Activity!I6:I505,"Withholding")',
+         "Negative standalone cash entries only; avoids double-counting trade costs", FMT_MONEY),
+        ("Total actual P/L SAR", "=B8+B9+B10+B11",
+         "Unrealized + realized + net dividends + standalone costs", FMT_MONEY),
+        ("Fees paid SAR",
+         '=SUMPRODUCT(Activity!N6:N505,Activity!M6:M505)+SUMPRODUCT((Activity!I6:I505="Fee")*Activity!P6:P505*Activity!M6:M505)',
+         "Positive information line; already reflected in actual P/L where applicable", FMT_MONEY),
+        ("Taxes paid SAR",
+         '=SUMPRODUCT((Activity!I6:I505<>"Dividend")*Activity!O6:O505*Activity!M6:M505)+SUMPRODUCT((Activity!I6:I505="Tax")*Activity!P6:P505*Activity!M6:M505)',
+         "Excludes dividend withholding shown separately", FMT_MONEY),
+        ("Dividend withholding SAR",
+         '=SUMPRODUCT((Activity!I6:I505="Dividend")*Activity!O6:O505*Activity!M6:M505)+SUMPRODUCT((Activity!I6:I505="Withholding")*Activity!P6:P505*Activity!M6:M505)',
+         "Positive information line governed by the selected Sharia/tax method", FMT_MONEY),
+        ("FX effect SAR", "Pending complete non-SAR transaction FX history",
+         "Price return and currency translation remain separate; no fabricated FX attribution", None),
+        ("Net external flows SAR",
+         '=SUMIFS(Activity!X6:X505,Activity!I6:I505,"Deposit")+SUMIFS(Activity!X6:X505,Activity!I6:I505,"Withdrawal")',
+         "Deposits positive and withdrawals negative; excluded from profit", FMT_MONEY),
+        ("Simple return", '=IFERROR(B12/B7,"")',
+         "Diagnostic only; use TWR/XIRR when dated history is sufficient", FMT_PCT),
+        ("Money-weighted return (XIRR)", "Pending complete dated cash-flow history",
+         "Requires broker-confirmed external flows and valuations", None),
+        ("Actual drawdown", "Pending sufficient dated valuation history",
+         "No historical path is manufactured from the opening snapshot", None),
+        ("Concentration", "=Portfolio!E30", "Largest current position weight", FMT_PCT),
+        ("Turnover since opening",
+         '=IFERROR(SUMPRODUCT(((Activity!I6:I505="Buy")+(Activity!I6:I505="Sell"))*Activity!J6:J505*Activity!K6:K505*Activity!M6:M505)/AVERAGE(B6,B7),0)',
+         "Gross recorded buys and sells divided by average of value and cost basis", FMT_PCT),
+        ("Cash balance SAR (ledger)", '=SUMIFS(Activity!W6:W505,Activity!L6:L505,"SAR")',
+         "Opening cash remains pending until broker evidence is supplied", FMT_MONEY),
+        ("Cash balance USD (ledger)", '=SUMIFS(Activity!W6:W505,Activity!L6:L505,"USD")',
+         "Retained in original currency; opening cash remains pending", FMT_MONEY),
+        ("Saudi benchmark", "TASI — configurable; history pending",
+         "Use a Sharia-compatible comparison selected by the owner where required", None),
+        ("US benchmark", "S&P 500 total return — configurable; history pending",
+         "Use an owner-approved Sharia-compatible alternative where required", None),
+        ("Simulated proposal outcomes", "Excluded from actual P/L",
+         "Research scenarios never change actual performance or Activity", None),
+    ]
+    for idx, (label, value, note, fmt) in enumerate(metrics_rows, 6):
+        put(ws, idx, 1, label, font=F_LBL, border=B_ALL)
+        put(ws, idx, 2, value, font=F_VAL, border=B_ALL, fmt=fmt)
+        put(ws, idx, 3, note, font=F_NOTE, border=B_ALL)
+    header_row(ws, 30, 1, ["Date", "Net External Flow SAR", "Ending Value SAR", "Period Return",
+                           "TWR Index", "Benchmark", "Benchmark Return", "Review ID", "Notes"])
+    put(ws, 31, 1, BOOK_BUILD_DATE, font=F_IN, fill=FILL_IN, border=B_ALL)
+    put(ws, 31, 2, None, font=F_IN, fill=FILL_IN, fmt=FMT_MONEY, border=B_ALL)
+    put(ws, 31, 3, "=B6", font=F_VAL, fmt=FMT_MONEY, border=B_ALL)
+    put(ws, 31, 4, None, font=F_VAL, fmt=FMT_PCT, border=B_ALL)
+    put(ws, 31, 5, 1, font=F_VAL, fmt=FMT_NUM2, border=B_ALL)
+    put(ws, 31, 6, "Pending", font=F_IN, fill=FILL_IN, border=B_ALL)
+    put(ws, 31, 8, "REVIEW-%s-INITIAL" % BOOK_BUILD_ID_DATE,
+        font=F_IN, fill=FILL_IN, border=B_ALL)
+    put(ws, 31, 9, "Opening valuation snapshot only; no historical return asserted",
+        font=F_IN, fill=FILL_IN, border=B_ALL)
+    for r in range(32, 506):
+        put(ws, r, 4, f'=IF(OR(A{r}="",C{r}="",C{r-1}=""),"",(C{r}-B{r})/C{r-1}-1)',
+            font=F_VAL, fmt=FMT_PCT, border=B_ALL)
+        put(ws, r, 5, f'=IF(D{r}="","",E{r-1}*(1+D{r}))', font=F_VAL,
+            fmt=FMT_NUM2, border=B_ALL)
+    set_widths(ws, {"A": 25, "B": 18, "C": 45, "D": 15, "E": 14,
+                    "F": 20, "G": 18, "H": 25, "I": 45})
+    set_filter(ws, 30, 505, 9)
+    ws.freeze_panes = "A6"
+    return ws
+
+
+def sheet_checks(wb):
+    ws = wb.create_sheet("Checks")
+    ws.sheet_view.showGridLines = False
+    put(ws, 2, 1, "الإعدادات وفحوص السلامة", font=F_TITLE)
+    header_row(ws, 4, 1, ["Setting", "Value", "Purpose"])
+    settings = [
+        ("Reporting currency", "SAR", "All portfolio totals"),
+        ("Timezone", "Asia/Riyadh", "Review and refresh timestamps"),
+        ("Minimum data completeness", 0.70, "Below this, scores are not actionable"),
+        ("Sharia authority", None, "Pending owner selection"),
+        ("Max position soft", None, "Pending owner limit"),
+        ("Max position hard", None, "Pending owner limit; blocks buys"),
+        ("Max sector", None, "Pending owner limit; blocks buys"),
+        ("Saudi broker", None, "Pending owner input"),
+        ("Cash balance SAR", None, "Pending broker statement / owner input"),
+        ("US broker", None, "Pending owner input"),
+        ("Review cadence", None, "Prepared but not scheduled until approved"),
+        ("Price stale after days", 5, "Calendar-day warning; market calendars recorded separately"),
+        ("Sharia methodology / version", None, "Pending owner selection; never silently inferred"),
+        ("Cash balance USD", None, "Pending broker statement / owner input"),
+        ("Saudi benchmark", None, "Pending owner-approved Sharia-compatible comparison"),
+        ("US benchmark", None, "Pending owner-approved Sharia-compatible comparison"),
+    ]
+    for idx, (key, value, note) in enumerate(settings, 5):
+        put(ws, idx, 1, key, font=F_LBL, border=B_ALL)
+        put(ws, idx, 2, value, font=F_IN, fill=FILL_IN, border=B_ALL,
+            fmt=FMT_PCT if "Max " in key or "completeness" in key else None)
+        put(ws, idx, 3, note, font=F_NOTE, border=B_ALL)
+    header_row(ws, 23, 1, ["Check", "Result", "Severity", "Meaning"])
+    checks = [
+        ("Duplicate transaction IDs", '=IF(COUNTIF(Activity!AA6:AA505,"DUPLICATE")=0,"PASS","FAIL")', "ERROR", "Repeated imports must be idempotent"),
+        ("Missing FX", '=IF(COUNTIFS(Activity!L6:L505,"<>SAR",Activity!A6:A505,"<>",Activity!M6:M505,"<=0")=0,"PASS","FAIL")', "ERROR", "No non-SAR accounting without an FX rate"),
+        ("Negative positions", '=IF(COUNTIF(Portfolio!E6:E25,"<0")=0,"PASS","FAIL")', "ERROR", "A sale cannot exceed holdings"),
+        ("Sharia buy/add gate", '=IF(COUNTIFS(Orders!N6:N505,"Buy",Orders!AM6:AM505,"<>Compliant")+COUNTIFS(Orders!N6:N505,"Add",Orders!AM6:AM505,"<>Compliant")=0,"PASS","FAIL")', "ERROR", "No Buy/Add unless the current screen is compliant"),
+        ("Sharia evidence", '=IF(COUNTIFS(Orders!N6:N505,"Buy",Orders!AN6:AN505,"")+COUNTIFS(Orders!N6:N505,"Add",Orders!AN6:AN505,"")=0,"PASS","FAIL")', "ERROR", "Every Buy/Add needs linked evidence"),
+        ("Risk limits configured", '=IF(AND(B9<>"",B10<>"",B11<>""),"PASS","WARN")', "WARNING", "Orders stay blocked while limits are pending"),
+        ("Cash configured SAR/USD", '=IF(AND(B13<>"",B18<>""),"PASS","WARN")', "WARNING", "Sizing requires market-currency cash"),
+        ("Review cadence configured", '=IF(B15<>"","PASS","WARN")', "WARNING", "No automation is activated yet"),
+        ("Opening history complete", '=IF(COUNTBLANK(Activity!B6:B10)=0,"PASS","WARN")', "WARNING", "Acquisition dates await broker history"),
+        ("Five current holdings", '=IF(COUNTIF(Portfolio!E6:E25,">0")=5,"PASS","FAIL")', "ERROR", "Baseline preservation check"),
+        ("Owned price freshness", '=IF(COUNTIFS(Portfolio!B6:B25,"<>",Portfolio!AD6:AD25,"<>Fresh")=0,"PASS","FAIL")', "ERROR", "Owned securities require a current dated source"),
+        ("Filled proposals reconciled", '=IF(COUNTIFS(Orders!AR6:AR505,"Filled",Orders!BD6:BD505,"<>OK")+COUNTIFS(Orders!AR6:AR505,"Part-filled",Orders!BD6:BD505,"<>OK")=0,"PASS","FAIL")', "ERROR", "Fills need broker evidence and an Activity transaction ID"),
+        ("Submitted broker references", '=IF(COUNTIFS(Orders!AR6:AR505,"Submitted",Orders!BD6:BD505,"<>OK")=0,"PASS","FAIL")', "ERROR", "Submitted orders need broker order IDs"),
+        ("Approved/submitted unblocked", '=IF(COUNTIFS(Orders!AR6:AR505,"Approved",Orders!AP6:AP505,"<>")+COUNTIFS(Orders!AR6:AR505,"Submitted",Orders!AP6:AP505,"<>")+COUNTIFS(Orders!AR6:AR505,"Part-filled",Orders!AP6:AP505,"<>")=0,"PASS","FAIL")', "ERROR", "No active order while a hard blocker remains"),
+        ("Lifecycle statuses valid", '=IF(COUNTA(Orders!A6:A505)=COUNTIF(Orders!AR6:AR505,"Proposed")+COUNTIF(Orders!AR6:AR505,"Approved")+COUNTIF(Orders!AR6:AR505,"Submitted")+COUNTIF(Orders!AR6:AR505,"Part-filled")+COUNTIF(Orders!AR6:AR505,"Filled")+COUNTIF(Orders!AR6:AR505,"Cancelled")+COUNTIF(Orders!AR6:AR505,"Expired")+COUNTIF(Orders!AR6:AR505,"Superseded"),"PASS","FAIL")', "ERROR", "Every proposal uses the exact controlled lifecycle"),
+        ("Duplicate proposal versions", '=IF(COUNTIF(Orders!BC6:BC505,"DUPLICATE")=0,"PASS","FAIL")', "ERROR", "Proposal ID plus version must be unique"),
+        ("Active horizon conflicts", '=IF(COUNTIF(Orders!BE6:BE505,"CONFLICT")=0,"PASS","FAIL")', "ERROR", "At most one active executable order per ticker"),
+        ("Executable terms complete", '=IF(COUNTIFS(Orders!N6:N505,"Buy",Orders!Q6:Q505,"")+COUNTIFS(Orders!N6:N505,"Add",Orders!Q6:Q505,"")+COUNTIFS(Orders!N6:N505,"Trim",Orders!Q6:Q505,"")+COUNTIFS(Orders!N6:N505,"Exit",Orders!Q6:Q505,"")+COUNTIFS(Orders!N6:N505,"Buy",Orders!O6:O505,"No order")+COUNTIFS(Orders!N6:N505,"Add",Orders!O6:O505,"No order")+COUNTIFS(Orders!N6:N505,"Trim",Orders!O6:O505,"No order")+COUNTIFS(Orders!N6:N505,"Exit",Orders!O6:O505,"No order")=0,"PASS","FAIL")', "ERROR", "Executable actions require quantity and order type"),
+    ]
+    for idx, (name, formula, severity, meaning) in enumerate(checks, 24):
+        put(ws, idx, 1, name, font=F_LBL, border=B_ALL)
+        put(ws, idx, 2, formula, font=F_VAL, border=B_ALL, align=CENTER)
+        put(ws, idx, 3, severity, font=F_VAL, border=B_ALL, align=CENTER)
+        put(ws, idx, 4, meaning, font=F_NOTE, border=B_ALL)
+    header_row(ws, 44, 1, ["Review ID", "Run At", "Scope", "Outcome", "Evidence", "Notes"])
+    review = ["REVIEW-%s-INITIAL" % BOOK_BUILD_ID_DATE, BOOK_BUILD_DATE,
+              "Five existing Saudi holdings",
+              "WAIT — Sharia authority/method/version, evidence, cash, brokers and owner limits pending",
+              "Risk & Horizons sources; Sharia intentionally Uncertain; Orders Proposed/Wait",
+              "Manual end-to-end control test; no executable quantity and no broker execution"]
+    for col, value in enumerate(review, 1):
+        put(ws, 45, col, value, font=F_VAL, border=B_ALL)
+    set_widths(ws, {"A": 30, "B": 24, "C": 46, "D": 48, "E": 48, "F": 48})
+    ws.freeze_panes = "A5"
+    return ws
+
+
+# --------------------------------------------------------------------------
 # Guide
 # --------------------------------------------------------------------------
 
 GUIDE_CONTENT = [
     ("h", "دليل الاستخدام"),
-    ("p", "هذا الملف أداة تحليل للأسهم السعودية (تداول). الخلايا الصفراء فقط قابلة "
-          "للتعديل، وباقي الأرقام إما معادلات أو بيانات ثابتة من آخر تحديث."),
-    ("h", "المفاهيم"),
-    ("p", "النتيجة المركبة: رقم من 0 إلى 100 يجمع خمسة محاور بأوزان ثابتة، والأعلى أفضل."),
-    ("p", "التقييم: ترجمة النتيجة إلى شريحة — شراء قوي (80 فأكثر)، شراء (65-79)، "
-          "تعزيز/احتفاظ (50-64)، بيع (35-49)، بيع قوي (أقل من 35)."),
-    ("p", "أقصى تراجع: أسوأ هبوط من قمة إلى قاع خلال الفترة، ويقاس بالسالب."),
-    ("p", "نظام التقلب: مقارنة تقلب 20 يوماً بتقلب 60 يوماً. «مرتفع» يعني أن النافذة "
-          "الأطول أكثر اضطراباً، أي أن السهم يمر بفترة ضغط."),
-    ("p", "SMA200: المتوسط المتحرك لمئتي يوم. «فوق» يعني أن السعر أعلى من المتوسط، "
-          "و«تحت» يعني أنه أدنى منه."),
-    ("p", "بيتا النفط: تصنيف قطاعي تقريبي لاتجاه تأثر السهم بأسعار النفط "
-          "(موجبة / سالبة / محايدة)، وليس معاملاً محسوباً."),
-    ("h", "الأوزان"),
-    ("p", "القيمة (مكرر الربحية) 30% — أوضح عامل مثبت في السوق السعودي: الشرائح الأرخص "
-          "سبقت الشرائح الأغلى في العائد التاريخي بفارق أكبر من أي عامل آخر."),
-    ("p", "الجودة (العائد على حقوق الملكية) 20% — ROE المرتفع والمستقر يميّز الشركات "
-          "التي تعيد استثمار أرباحها بكفاءة، ويقلّل احتمال انهيار الأرباح فجأة."),
-    ("p", "الفني (SMA200 مع الزخم) 20% — فلتر الاتجاه يمنع الدخول في الأسهم الهابطة، "
-          "والزخم 12-1 من أكثر الإشارات ثباتاً عبر الأسواق الناشئة ومنها تداول."),
-    ("p", "التوزيعات 15% — السوق السعودي سوق توزيعات: جزء كبير من العائد التاريخي جاء "
-          "من الأرباح النقدية لا من ارتفاع السعر وحده."),
-    ("p", "المخاطر (أقصى تراجع سنتين) 15% — الأسهم الأقل تراجعاً أسهل في الالتزام بها، "
-          "ولا تجبر المستثمر على البيع في القاع."),
-    ("p", "أي عنصر ناقص يأخذ 50 نقطة (محايد) بدلاً من صفر، حتى لا تُعاقب الشركة على "
-          "نقص في مصدر البيانات."),
-    ("h", "قواعد المخاطر"),
-    ("p", "التنويع: من 10 إلى 15 سهماً. أقل من ذلك تركيز عالٍ، وأكثر منه صعب المتابعة."),
-    ("p", "حجم المركز: سهم واحد لا يتجاوز 20% عملياً، و40% حد صارم لا يُخترق. خانة "
-          "«حالة التركيز» في ورقة Portfolio تتحول إلى «عالي» عند 40% فأكثر."),
-    ("p", "فلتر SMA200: لا تبنِ مركزاً في سهم تحت متوسط 200 يوم — هذا الفلتر وحده يقلّص "
-          "عمق التراجع إلى النصف تقريباً مقارنة بالشراء دون فلتر."),
-    ("p", "نظام التقلب: قلّل التعرض عندما يكون «مرتفع»، وزده تدريجياً عندما يعود «عادي»."),
-    ("p", "موازنة بيتا النفط: لا تجعل المحفظة كلها في اتجاه واحد. الطاقة والبتروكيماويات "
-          "والمرافق بيتا نفط موجبة، والبنوك والمالية سالبة، والصحة والاتصالات "
-          "والاستهلاكي محايدة. اخلط الثلاثة."),
+    ("p", "هذا كتاب استثماري شخصي موحّد للسوقين السعودي والأمريكي. العملة الأصلية تبقى "
+          "محفوظة، بينما تجمع تقارير المحفظة بالريال السعودي وفي توقيت Asia/Riyadh."),
+    ("h", "ترتيب العمل"),
+    ("p", "Activity هو السجل المحاسبي الوحيد: الشراء والبيع والتوزيعات والرسوم والضرائب "
+          "والاستقطاع والإيداعات والسحوبات والتحويلات والانقسامات. Portfolio مشتق منه ولا يُعدل يدوياً."),
+    ("p", "Sharia هو سجل الدليل: الجهة والمنهجية والإصدار وفترة التقرير وفحص النشاط والنسب "
+          "والتواريخ والتطهير المستحق والمدفوع. الحالات: Compliant وNon-compliant وUncertain "
+          "وReview overdue. لا شراء مع دليل ناقص أو منتهي، ولا يختار Codex منهجية دينية عن المالك."),
+    ("p", "Orders طابور مقترحات مصنف وليس قناة تنفيذ. الإجراءات: Buy وAdd وHold وTrim وExit "
+          "وWait. دورة الحالة: Proposed ثم Approved وSubmitted وPart-filled وFilled أو Cancelled "
+          "أو Expired أو Superseded. لمس السعر لا يثبت التنفيذ، وفقط إثبات الوسيط يحدّث Activity."),
+    ("h", "الحسابات"),
+    ("p", "تكلفة المراكز بطريقة المتوسط المرجّح. البيع يخفض التكلفة بمتوسط الوحدة قبل "
+          "الصفقة ويظهر الربح المحقق منفصلاً. كل صف يحمل Transaction ID لمنع الاستيراد المكرر."),
+    ("p", "العائد السنوي مبني على إغلاق Yahoo Finance المعدّل للانقسامات والتوزيعات؛ لذلك "
+          "هو عائد إجمالي. السعر والتوزيعات وFX والرسوم والاستقطاع والتدفقات الخارجية تبقى "
+          "مفصولة، وPerformance لا يخلط الإيداعات بالأرباح أو المقترحات بالأداء الفعلي. "
+          "مرجع الضبط: https://ranaroussi.github.io/yfinance/reference/yfinance.price_history.html"),
+    ("p", "زخم 12-1 يقارن السعر قبل 12 شهراً بالسعر قبل شهر ويستبعد آخر 21 جلسة. مستوى "
+          "التقلب (منخفض/عادي/مرتفع) منفصل عن اتجاهه (صاعد/مستقر/هابط)."),
+    ("p", "النتيجة المركبة تعيد وزن العناصر المتاحة فقط، وتعرض اكتمال البيانات. دون 70% "
+          "تظهر بيانات ناقصة ولا يجوز تحويل النتيجة إلى إجراء."),
     ("h", "الآفاق الثلاثة"),
-    ("p", "كل حكم يجمع نقاطاً موجبة وسالبة ثم: مجموع +2 فأكثر → «إيجابي»، ومجموع -2 فأقل "
-          "→ «سلبي»، وما بينهما → «محايد». أي عنصر ناقص لا يضيف ولا يخصم، وإذا غابت كل "
-          "العناصر يصبح الحكم «محايد (بيانات ناقصة)»."),
-    ("p", "حكم قريب (1-3 أشهر): فوق SMA200 (+1) أو تحته (-1)؛ RSI بين 40 و70 (+1)، أو "
-          "فوق 70 تشبع شرائي (-1)، أو تحت 30 تشبع بيعي وارتداد محتمل (+1)؛ نظام تقلب "
-          "مرتفع (-1)؛ عائد الشهر موجب (+1) أو سالب (-1)."),
-    ("p", "حكم متوسط (6-18 شهراً): عائد 6 أشهر موجب (+1) وإلا (-1)؛ عائد سنة موجب (+1) "
-          "وإلا (-1)؛ فوق SMA200 (+1) وإلا (-1)؛ مكرر ربحية 18 فأقل (+1) أو أكثر من 25 "
-          "(-1)؛ أقصى تراجع سنتين أفضل من -25% (+1) وإلا (-1)."),
-    ("p", "حكم بعيد (3 سنوات فأكثر): ROE 20% فأكثر (+2) أو 15% فأكثر (+1) أو أقل من 5% "
-          "(-1)؛ عائد توزيعات 3% فأكثر (+1)؛ نسبة توزيع 80% فأقل (+1) أو أكثر من 100% "
-          "(-1)؛ مكرر ربحية 18 فأقل (+1) أو أكثر من 25 (-1)."),
-    ("p", "كيف تُستخدم: الحكم البعيد يقرر «هل أملك هذا السهم أصلاً»، والمتوسط يقرر «هل "
-          "أزيد أم أخفّف»، والقريب يقرر «متى أنفّذ». تعارض الأحكام إشارة انتظار، "
-          "وليس إشارة بيع."),
-    ("h", "كيفية التحديث"),
-    ("p", "التحديث السريع (refresh.bat quick): يحدّث الأسعار والعوائد والمؤشرات الفنية "
-          "لكل الرموز فقط — دقائق معدودة، ولا يلمس القوائم المالية."),
-    ("p", "التحديث الكامل (refresh.bat full): يعيد سحب التاريخ السنوي والقوائم المالية "
-          "كاملة ثم يعيد بناء الملف — أبطأ بكثير، ويُستخدم كل ربع سنة أو بعد إعلان النتائج."),
-    ("p", "مراكزك محفوظة بعد أي تحديث: البناء يقرأ الرمز وعدد الأسهم ومتوسط التكلفة من "
-          "الملف السابق ويعيد كتابتها في الملف الجديد."),
-    ("h", "حدود صادقة"),
-    ("p", "لا يوجد مؤشر تاسي عبر هذا المصدر، لذلك لا توجد بيتا حقيقية مقابل السوق ولا "
-          "أداء نسبي مقابل المؤشر."),
-    ("p", "القوائم المالية متاحة لخمس سنوات فقط (2021-2025)، وما قبلها غير متوفر."),
-    ("p", "الأسعار مؤخرة وليست لحظية، ولا تصلح للتداول اليومي."),
-    ("p", "«بيانات ناقصة» تعني أن المصدر لم يعطِ القيمة؛ يُحتسب العنصر محايداً ولا "
-          "يُفسَّر كإشارة سلبية."),
-    ("p", "هذه الأداة مساعدة على القرار وليست توصية استثمارية."),
+    ("p", "6 أشهر: الاتجاه المتوسط والزخم القصير وRSI ومستوى/اتجاه التقلب. سنتان: العائد "
+          "السنوي وزخم 12-1 وSMA200 والتقييم والتراجع. 5 سنوات: جودة الأرباح وROE "
+          "والتوزيعات واستدامتها والتقييم والمخاطر الهيكلية."),
+    ("p", "الآفاق الثلاثة عدسات بحث لمركز واحد وليست ثلاث حصص متعارضة. الإشارة ليست ترجمة "
+          "آلية للنتيجة؛ تُحجب عند نقص البيانات أو الدليل الشرعي أو النقد أو حدود المخاطر، "
+          "ولا يجوز وجود أكثر من أمر نشط واحد للأسهم نفسها."),
+    ("h", "المخاطر والإعدادات"),
+    ("p", "حدود المركز المرنة والصارمة وحد القطاع قابلة للضبط في Checks. بقيت معلّقة حتى "
+          "يعتمدها المالك؛ أي اقتراح شراء يبقى Wait في هذه الأثناء."),
+    ("p", "السعودية تستخدم SAR وتوقيت Asia/Riyadh وتسوية الأسهم T+2 بحسب Saudi Exchange: "
+          "https://www.saudiexchange.sa/wps/portal/saudiexchange/trading/market-services/equities?locale=en . "
+          "أمريكا تستخدم USD وتوقيت America/New_York مع DST وتسوية T+1 بحسب SEC: "
+          "https://www.sec.gov/rules-regulations/2023/02/34-96930 . قواعد الكمية والأمر يؤكدها الوسيط."),
+    ("h", "التحديث والمراجعة"),
+    ("p", "التحديث يكتب فترة القوائم وتاريخ النشر ووقت الملاحظة ووقت الجلب وأساس السعر والعائد "
+          "ووحدة التوزيعات والمصدر والرابط. عند الفشل يبقى آخر سجل صالح معلّماً stale ولا يُستبدل بتخمين."),
+    ("p", "التحديثات تحفظ Activity وSharia وقرارات Orders وسجل Performance وإعدادات Checks "
+          "وسجل المراجعات. الاستيراد المتكرر بالمعرف نفسه يحدّث الصف ولا يضاعف الحركة. "
+          "XIRR لا يُستخدم قبل تدفقات مؤرخة كافية: https://support.google.com/docs/answer/3093266 "
+          "ومرجع الأداء: https://www.cfainstitute.org/-/media/documents/code/gips/2020-gips-standards-asset-owners.pdf"),
+    ("p", "سير المراجعة: اقرأ السياسة والمراكز؛ تحقق من البيانات والدليل الشرعي؛ ابحث التغييرات؛ "
+          "حدّث الآفاق؛ قيّم ملاءمة المحفظة؛ حدّث المقترحات؛ وسجّل التغييرات والمصادر. الجدولة "
+          "مُهيأة فقط ولا تُفعّل حتى يختار المالك الوتيرة، والإشعار للتغيير المهم أو الفشل فقط."),
+    ("h", "حدود صريحة"),
+    ("p", "الأسعار ليست لحظية، وYahoo Finance مصدر مجاني قد ينقصه بعض الحقول. حالة "
+          "Uncertain لا تعني مخالفة شرعية؛ تعني أن الدليل المعتمد غير مكتمل."),
+    ("p", "هذه أداة حفظ وتحليل ومراجعة وليست توصية أو تفويضاً بالتداول. سعر الوقف لا يضمن "
+          "حداً أقصى للخسارة، ولا يُشترى اشتراك بيانات أو تُنشأ خدمة مدفوعة من دون موافقة المالك."),
 ]
 
 
@@ -1148,7 +2047,7 @@ def sheet_guide(wb):
 # --------------------------------------------------------------------------
 
 def build(out_path, data_dir="data", preserve_from=None):
-    """Build the full 7-sheet workbook from CSV/JSON data.
+    """Build the full auditable Saudi/US investment book from CSV/JSON data.
 
     preserve_from: path to a previous v2 xlsx — read Portfolio sheet columns
     B (symbol), E (shares), F (cost) rows 6-25 from it and restore into the new
@@ -1164,12 +2063,18 @@ def build(out_path, data_dir="data", preserve_from=None):
     wb = Workbook()
     wb.remove(wb.active)
     sheet_portfolio(wb, holdings)
+    sheet_orders(wb, holdings, rows)
     sheet_lookup(wb, rows)
+    sheet_performance(wb)
+    sheet_activity(wb, holdings)
+    sheet_sharia(wb, holdings, rows)
     sheet_risk(wb, rows)
     sheet_db(wb, data, rows)
     sheet_statements(wb, data, rows)
     sheet_symbols(wb, data["all_symbols"])
+    sheet_checks(wb)
     sheet_guide(wb)
+    restore_manual_records(wb, preserve_from)
     assert wb.sheetnames == SHEET_ORDER, wb.sheetnames
     wb.active = 0
 

@@ -10,6 +10,7 @@ import statistics
 
 TRADING_DAYS = 252
 NEUTRAL = 50.0
+DEFAULT_MIN_COMPLETENESS = 0.70
 
 
 # --------------------------------------------------------------------------
@@ -111,13 +112,17 @@ def sma200_flag(closes, window=200):
     return "above" if prices[-1] > sma else "below"
 
 
-def vol_regime(closes, short=20, long=60):
-    """Compare short- and long-window annualized vol -> 'HIGH' / 'NORMAL'.
+def volatility_state(closes, short=20, long=60, trend_band=0.10,
+                     high_level=0.40, low_level=0.20):
+    """Return volatility *level* and *trend* as separate concepts.
 
-    NOTE: the reference test fixture places its volatility shock inside the
-    60-day window but outside the 20-day one and still expects 'HIGH', so the
-    regime flags whichever window carries the stress: HIGH when the two windows
-    disagree with the long window hotter, NORMAL when they match.
+    ``level`` is based on the longer-window annualized volatility, while
+    ``trend`` compares the recent window with that longer baseline.  This
+    avoids the old direction bug where a calmer recent month could be labelled
+    HIGH merely because the older 60-day window still contained a shock.
+
+    The returned dictionary also carries the measured volatilities and ratio so
+    workbook users can audit the classification rather than trusting a label.
     """
     prices = _floats(closes)
     if len(prices) < long + 1:
@@ -127,18 +132,53 @@ def vol_regime(closes, short=20, long=60):
     v_long = _vol(rets[-long:])
     if v_short is None or v_long is None:
         return None
-    return "HIGH" if v_long > v_short else "NORMAL"
+    if v_long >= high_level:
+        level = "HIGH"
+    elif v_long < low_level:
+        level = "LOW"
+    else:
+        level = "NORMAL"
+
+    if v_long == 0:
+        ratio = 1.0 if v_short == 0 else float("inf")
+    else:
+        ratio = v_short / v_long
+    if ratio > 1.0 + trend_band:
+        trend = "RISING"
+    elif ratio < 1.0 - trend_band:
+        trend = "FALLING"
+    else:
+        trend = "STABLE"
+    return {
+        "level": level,
+        "trend": trend,
+        "short_vol": v_short,
+        "long_vol": v_long,
+        "ratio": ratio,
+    }
 
 
-def momentum_12_1(closes, lookback=231):
-    """12-month price momentum: last close vs the close `lookback` bars back."""
+def vol_regime(closes, short=20, long=60):
+    """Compatibility wrapper returning the absolute volatility level."""
+    state = volatility_state(closes, short=short, long=long)
+    return None if state is None else state["level"]
+
+
+def momentum_12_1(closes, lookback=252, skip=21):
+    """Conventional 12-1 momentum, excluding the most recent month.
+
+    The calculation is ``P[t-skip] / P[t-lookback] - 1`` over trading bars.
+    Both endpoints precede the current close, so none of the latest ``skip``
+    returns leak into the signal.
+    """
     prices = _floats(closes)
-    if len(prices) < lookback:
+    if lookback <= skip or len(prices) <= lookback:
         return None
-    base = prices[-lookback]
+    base = prices[-(lookback + 1)]
     if base == 0:
         return None
-    return prices[-1] / base - 1.0
+    end = prices[-(skip + 1)]
+    return end / base - 1.0
 
 
 # --------------------------------------------------------------------------
@@ -218,22 +258,50 @@ def _risk_score(maxdd_2y):
     return 20.0
 
 
+def composite_score_with_coverage(pe, roe, div_yield, tech_pair, maxdd_2y,
+                                  min_completeness=DEFAULT_MIN_COMPLETENESS):
+    """Return a reweighted score plus an explicit data-completeness gate.
+
+    Missing components are excluded from both numerator and denominator.  They
+    no longer receive a synthetic neutral 50, which previously made sparse
+    records look investable.  ``completeness`` is the available model weight,
+    and ``actionable`` is true only when it meets ``min_completeness``.
+    """
+    components = [
+        (0.30, pe is not None and pe > 0, _pe_score(pe)),
+        (0.20, roe is not None, _roe_score(roe)),
+        (0.20, bool(tech_pair) and len(tech_pair) == 2
+         and tech_pair[0] is not None and tech_pair[1] is not None,
+         _tech_score(tech_pair)),
+        (0.15, div_yield is not None, _dividend_score(div_yield)),
+        (0.15, maxdd_2y is not None, _risk_score(maxdd_2y)),
+    ]
+    available_weight = sum(weight for weight, present, _ in components if present)
+    if available_weight == 0:
+        return {"score": None, "completeness": 0.0, "actionable": False}
+    weighted = sum(weight * value for weight, present, value in components if present)
+    score = weighted / available_weight
+    completeness = round(available_weight, 4)
+    return {
+        "score": round(score, 2),
+        "completeness": completeness,
+        "actionable": completeness >= min_completeness,
+    }
+
+
 def composite_score(pe, roe, div_yield, tech_pair, maxdd_2y):
-    """Weighted 0-100 composite: value .30, quality .20, tech .20, div .15, risk .15."""
-    score = (
-        0.30 * _pe_score(pe)
-        + 0.20 * _roe_score(roe)
-        + 0.20 * _tech_score(tech_pair)
-        + 0.15 * _dividend_score(div_yield)
-        + 0.15 * _risk_score(maxdd_2y)
-    )
-    return round(score, 2)
+    """Compatibility wrapper returning the coverage-aware numeric score."""
+    return composite_score_with_coverage(
+        pe, roe, div_yield, tech_pair, maxdd_2y
+    )["score"]
 
 
-def rating(score):
+def rating(score, completeness=None, min_completeness=DEFAULT_MIN_COMPLETENESS):
     """Arabic recommendation band for a composite score."""
     if score is None:
-        return None
+        return "بيانات ناقصة"
+    if completeness is not None and completeness < min_completeness:
+        return "بيانات ناقصة"
     if score >= 80:
         return "شراء قوي"
     if score >= 65:

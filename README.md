@@ -1,70 +1,63 @@
 # ورقة — Waraqah
 
-**A self-serve stock analysis workbook for the Saudi Exchange (Tadawul). Type any stock code, read a full report. No AI, no subscriptions, no API keys.**
+Waraqah is a personal, auditable Saudi/US investment book. The reporting currency is SAR, every transaction retains its original currency and FX rate, and no component can place an order with a broker.
 
-Waraqah (Arabic for "sheet of paper") builds a 7-sheet Excel workbook covering **202 Tadawul-listed companies** with price history back to 2015, fundamentals 2021–2025, risk metrics, and a research-backed scoring model adapted to the Saudi market. You refresh it with one double-click; everything is computed locally by a Python pipeline.
-
-![Sheets](https://img.shields.io/badge/sheets-7-blue) ![Stocks](https://img.shields.io/badge/stocks-202-green) ![Python](https://img.shields.io/badge/python-3.10%2B-informational)
-
-## What you get
+The workbook contains 12 native tabs:
 
 | Sheet | Purpose |
 |---|---|
-| **Portfolio** | Enter your holdings (code, shares, cost) → live market value, P/L, weights, concentration flags |
-| **Stock Lookup** | Type any 4-digit Tadawul code → full Arabic report card: returns (1W→1Y), RSI(14), volatility regime, SMA200 position, P/E, ROE, dividends, 2021–2025 statements, composite score and verdict |
-| **Risk & Horizons** | All 202 symbols: returns, drawdown, oil-beta proxy by sector, and قريب/متوسط/بعيد (short/mid/long) verdicts |
-| **DB** | Market database: annual return, volatility, max drawdown, dividends, momentum, P/E per symbol per year since 2015 |
-| **Statements** | Revenue, net income, EPS, ROE, D/E, payout 2021–2025 for every symbol |
-| **Symbols** | Full Tadawul reference list with Arabic/English names and sectors |
-| **Guide** | Arabic manual: how each metric works, the scoring model, risk rules, refresh instructions |
+| **Portfolio** | Positions, value, P/L, weights, Sharia state, three horizons, blockers |
+| **Orders** | Ranked Buy/Add/Hold/Trim/Exit/Wait queue with versioning, sizing gates and broker reconciliation |
+| **Stock Lookup** | Single-security report card |
+| **Performance** | Actual P/L components, external flows, concentration/turnover, dated TWR history and benchmarks |
+| **Activity** | Source-of-truth transaction and cash ledger with stable transaction IDs |
+| **Sharia** | Authority/method/version, business and ratio evidence, dates, change review and purification ledger |
+| **Risk & Horizons** | Saudi/US identifiers, fiscal/source/basis metadata, market rules, 6m/2y/5y views and freshness |
+| **DB** | Annual total-return and fundamental series |
+| **Statements** | Period-labelled annual financial statements |
+| **Symbols** | Security reference list |
+| **Checks** | Owner settings, Sharia/risk/data integrity gates, immutable review log |
+| **Guide** | Arabic operating guide and calculation definitions |
 
-Auto-filters are enabled on every table sheet. Missing fundamentals render as "بيانات ناقصة" (neutral) — never as `#N/A` errors.
+## Safety model
+
+- `Activity` is the accounting source of truth. Portfolio quantity and cost basis are formulas, not editable balances.
+- Broker imports are upserted by deterministic `Transaction ID`, so reimporting the same activity does not duplicate it.
+- Sales use moving weighted-average cost and realized P/L is separate from unrealized P/L.
+- A non-SAR movement without a positive `FX to SAR` is rejected.
+- `Buy` and `Add` proposals are blocked unless Sharia status is `Compliant`, authority/method/version, evidence, reporting period and screen dates are present, and the next review has not expired.
+- Executable proposals also remain blocked while cash, broker/account rules, quantity, owner thesis or owner-approved position and sector limits are missing.
+- Missing model inputs are excluded and the available weights are re-normalized. Scores below 70% data completeness are labelled non-actionable, not neutral.
+- Orders are review records only. Lifecycle values are `Proposed`, `Approved`, `Submitted`, `Part-filled`, `Filled`, `Cancelled`, `Expired`, and `Superseded`. A broker order ID and fill evidence are required before a fill can reconcile to `Activity`.
+- The three horizons are research lenses over one shared position. A control prevents more than one active executable order for the same ticker.
+
+## Calculation conventions
+
+- Price history: Yahoo Finance `auto_adjust=True`, explicitly recorded as an adjusted-close total-return basis.
+- Annual return: last adjusted close / first adjusted close - 1 for the stated calendar-year window.
+- Dividends: separately retained as cash per share in the listing currency.
+- Momentum 12–1: price at `t-21` trading sessions divided by price at `t-252`; the most recent month is excluded.
+- Volatility level: absolute 60-session annualized volatility. Volatility trend: the 20-session level relative to the 60-session baseline. They are separate.
+- Horizons: 6 months, 2 years and 5 years. A horizon is a structured view, not a prediction or guaranteed target.
+- Saudi default conventions: SAR, Asia/Riyadh, Saudi Exchange calendar and [T+2 equity settlement](https://www.saudiexchange.sa/wps/portal/saudiexchange/trading/market-services/equities?locale=en).
+- US default conventions: USD, America/New_York with daylight saving and [T+1 standard settlement](https://www.sec.gov/rules-regulations/2023/02/34-96930).
+- US support is normalization/accounting-tested without inserting fictional US holdings. Fractional-share and order capabilities remain broker-specific.
 
 ## Quick start
 
 ```bash
 pip install -r requirements.txt
-python -m pytest tests/ -v              # 10 unit tests
-python builder.py                       # build the workbook from the included seed data
+python -m pytest -q
+python builder.py --out Waraqah.xlsx --preserve previous_Waraqah.xlsx
+python verify_workbook.py Waraqah.xlsx --data-dir data
 ```
 
-Or just double-click **`refresh.bat`** → `1` (quick: re-price your portfolio, ~2 min) or `2` (full market rebuild, ~20–40 min). The finished file opens as `Sahm_Portfolio_Analysis_v2.xlsx` next to the repo folder — open it in Excel or LibreOffice and start typing codes.
+The `--preserve` workflow carries forward Activity, Sharia evidence, Orders decisions, Performance history, owner settings and the review log while rebuilding formula/helper columns from current code.
 
-To add your real holdings: type your 4-digit codes, shares, and average cost into the Portfolio sheet, then run `refresh.bat` → `1`. Your entries are preserved across rebuilds.
+See `CODEX_REVIEW.md` for the reusable agent review contract. Review scheduling is intentionally not activated until the owner chooses a cadence.
 
-## Scoring model (Saudi-adapted)
+## Data limitations
 
-Composite score 0–100 = **Value 30% + Quality 20% + Technical 20% + Dividend 15% + Risk 15%**.
+Yahoo Finance is a free, delayed and sometimes incomplete source. Every refresh records observation/retrieval time, price/return basis, fiscal period, source and URL. Missing or stale data is surfaced as a blocker; the last valid record is preserved. TWR, XIRR, drawdown, FX attribution, benchmarks and proposal sizing stay pending until the required broker/history or owner policy inputs exist.
 
-The weights follow published evidence on Tadawul: value (B/M) is the only factor with a significant premium across all examined portfolios (Alkhareif 2016; Alshaikhmubarek 2024), dividend yield carries a documented premium, momentum is weaker than in US markets (tactical overlay only), and small-cap tilts are an illiquidity trap. Risk rules use the 200-DMA trend filter (max drawdown roughly halved in backtests), volatility-managed exposure (Moreira & Muir 2017), 10–15 position diversification, and oil-beta balancing — energy is ~60% of TASI, so petchem vs. banks vs. consumer balance matters.
-
-Ratings: ≥80 شراء قوي · 65–79 شراء · 50–64 تعزيز/احتفاظ · 35–49 بيع · <35 بيع قوي.
-
-## How it works
-
-```
-fetcher.py → yfinance (.SR tickers) → data/*.csv (resumable cache)
-builder.py → openpyxl builds all 7 sheets (Excel-2007-era formulas only)
-LibreOffice headless → recalculates formula cache → verify_workbook.py (19 checks)
-           → promoted only if every check passes (fail-safe keeps the previous file)
-```
-
-- `metrics.py` — pure metric functions, TDD-tested (returns, volatility, drawdown, RSI, SMA200 flag, volatility regime, momentum, composite scoring)
-- `fetcher.py` — resilient fetcher: every yfinance call guarded, sleep + retries, resume support
-- `validate_symbols.py` — one-off tool that live-validates the symbol universe (drops Nomu codes Yahoo doesn't carry)
-- `verify_workbook.py` — 19 pinned-assert checks, exit 0/1
-
-## Data sources & honest limitations
-
-- **yfinance `.SR`** — daily prices back to ~2010, full dividend history; annual financial statements capped at **2021–2025** (Yahoo limit; deeper backfill would require scraping Argaam/Tadawul, deliberately out of scope)
-- **No TASI index history** via yfinance — benchmark with portfolio self-metrics instead
-- Quotes are delayed; some symbols have missing fundamentals (REITs often lack P/E) — shown as بيانات ناقصة and scored neutral
-- Symbol list parsed from the Arabic Wikipedia Tadawul listings page, then validated live against Yahoo
-
-## Disclaimer
-
-This tool is for personal research and education. It is **not investment advice**. Scores are mechanical factor rankings, not recommendations — do your own due diligence.
-
-## License
-
-MIT
+This tool is for personal recordkeeping and research, not investment advice.
